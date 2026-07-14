@@ -1,0 +1,133 @@
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform texture2d target;
+uniform float4 color;
+uniform float2 mul_val;
+uniform float2 add_val;
+
+uniform float2 target_texel;
+uniform float  mask_edge_blur;
+uniform float2 mask_offset;
+
+sampler_state textureSampler {
+    Filter    = Linear;
+    AddressU  = Clamp;
+    AddressV  = Clamp;
+};
+
+struct VertDataIn {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+struct VertDataOut {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+    float2 uv2 : TEXCOORD1; // Mask UV
+};
+
+VertDataOut VSDefault(VertDataIn v_in)
+{
+    VertDataOut o;
+    o.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    o.uv  = v_in.uv;
+
+    // Convert source UV -> mask UV (lock-aspect handled by mul_val/add_val on CPU)
+    o.uv2 = v_in.uv * mul_val + add_val;
+
+    // Offset in mask UV space (note: subtracting moves the mask visually as expected)
+    o.uv2 = o.uv2 - mask_offset;
+
+    return o;
+}
+
+float MaskAtLinear(float2 uv)
+{
+    float m = target.Sample(textureSampler, uv).r;
+
+    // If mask is bound as sRGB (not recommended for mask), uncomment this:
+    //m = pow(m, 2.2);
+
+    return m;
+}
+
+float Hash12(float2 p)
+{
+    float h = dot(p, float2(127.1, 311.7));
+    return frac(sin(h) * 43758.5453);
+}
+
+float MaskGaussianRound(float2 uv, float radiusPx)
+{
+    if (radiusPx <= 0.5)
+        return MaskAtLinear(uv);
+
+    float2 stepUV = target_texel * (radiusPx / 4.0);
+
+    const float w0 = 0.200;
+    const float w1 = 0.140;
+    const float w2 = 0.090;
+    const float w3 = 0.050;
+    const float w4 = 0.030;
+
+    float sum  = 0.0;
+    float wsum = 0.0;
+
+    sum  += MaskAtLinear(uv) * w0;
+    wsum += w0;
+
+    [unroll]
+    for (int i = 1; i <= 4; i++) {
+        float wi = (i==1)?w1:(i==2)?w2:(i==3)?w3:w4;
+
+        float2 ox = stepUV * float2((float)i, 0.0);
+        float2 oy = stepUV * float2(0.0, (float)i);
+
+        sum  += (MaskAtLinear(uv + ox) + MaskAtLinear(uv - ox)) * wi; wsum += 2.0 * wi;
+        sum  += (MaskAtLinear(uv + oy) + MaskAtLinear(uv - oy)) * wi; wsum += 2.0 * wi;
+    }
+
+    float2 d1 = stepUV * float2(1.0, 1.0);
+    sum += ( MaskAtLinear(uv + d1) + MaskAtLinear(uv - d1)
+           + MaskAtLinear(uv + float2( d1.x, -d1.y))
+           + MaskAtLinear(uv + float2(-d1.x,  d1.y)) ) * w2;
+    wsum += 4.0 * w2;
+
+    float2 d2 = stepUV * float2(2.0, 2.0);
+    sum += ( MaskAtLinear(uv + d2) + MaskAtLinear(uv - d2)
+           + MaskAtLinear(uv + float2( d2.x, -d2.y))
+           + MaskAtLinear(uv + float2(-d2.x,  d2.y)) ) * w3;
+    wsum += 4.0 * w3;
+
+    float m = sum / max(wsum, 1e-6);
+
+    float n = Hash12(uv * 4096.0) - 0.5;     // -0.5..0.5
+    m = saturate(m + n * (1.0 / 255.0));     // subtle 8-bit dither
+
+    return saturate(m);
+}
+
+float4 PSColorMaskRGBA(VertDataOut v_in) : TARGET
+{
+    float4 rgba = image.Sample(textureSampler, v_in.uv);
+
+	float radiusPx = mask_edge_blur * 0.32;
+    float m = MaskGaussianRound(v_in.uv2, radiusPx);
+
+    rgba.rgb *= color.rgb;
+    rgba.a   *= color.a;
+
+    rgba *= m;
+
+    return rgba;
+}
+
+technique Draw
+{
+    pass
+    {
+        vertex_shader = VSDefault(v_in);
+        pixel_shader  = PSColorMaskRGBA(v_in);
+    }
+}
