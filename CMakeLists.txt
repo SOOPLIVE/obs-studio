@@ -1,5 +1,13 @@
 cmake_minimum_required(VERSION 3.28...3.30)
 
+set(
+  OBS_VERSION_OVERRIDE
+  "31.0.2"
+  CACHE STRING
+  "Fixed OBS version"
+  FORCE
+)
+
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
 project(obs-studio VERSION ${OBS_VERSION_CANONICAL})
