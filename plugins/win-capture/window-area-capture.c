@@ -11,6 +11,10 @@
 #include <util/platform.h>
 #include <winrt-capture.h>
 #endif
+#include "dc-capture.h"
+#include "cursor-capture.h"
+#include "compat-helpers.h"
+
 
 /* clang-format off */
 
@@ -40,6 +44,8 @@
 #define WC_CHECK_TIMER 1.0f
 #define RESIZE_CHECK_TIME 0.2f
 #define CURSOR_CHECK_TIME 0.2f
+
+#define DXGI_RESET_INTERVAL 3.0f
 
 typedef BOOL (*PFN_winrt_capture_supported)();
 typedef BOOL (*PFN_winrt_capture_cursor_toggle_supported)();
@@ -77,6 +83,8 @@ enum window_area_capture_method {
 	METHOD_AUTO,
 	METHOD_BITBLT,
 	METHOD_WGC,
+
+	METHOD_DXGI = 3,
 };
 
 typedef DPI_AWARENESS_CONTEXT(WINAPI *PFN_SetThreadDpiAwarenessContext)(
@@ -105,6 +113,25 @@ struct window_area_capture {
 
 	struct dc_capture capture;
 
+	gs_duplicator_t *duplicator;
+	HMONITOR monitor_handle;
+	RECT monitor_rect;
+
+	uint32_t duplicator_width;
+	uint32_t duplicator_height;
+
+	uint32_t desktop_width;
+	uint32_t desktop_height;
+
+	long monitor_x;
+	long monitor_y;
+	int monitor_rotation;
+
+	bool duplicator_retry_wait;
+	float duplicator_reset_timer;
+
+	struct cursor_data cursor_data;
+
 	bool previously_failed;
 	void *winrt_module;
 	struct winrt_exports exports;
@@ -128,6 +155,7 @@ struct monitor_info {
 	int desired_id;
 	int id;
 	RECT rect;
+	HMONITOR handle;
 };
 
 static const char *wgc_partial_match_classes[] = {
@@ -216,29 +244,249 @@ static BOOL CALLBACK enum_monitor(HMONITOR handle, HDC hdc, LPRECT rect,
 	if (monitor->cur_id == 0 || monitor->desired_id == monitor->cur_id) {
 		monitor->rect = *rect;
 		monitor->id = monitor->cur_id;
+		monitor->handle = handle;
 	}
 
 	UNUSED_PARAMETER(hdc);
-	UNUSED_PARAMETER(handle);
-	return (monitor->desired_id > monitor->cur_id++);
+
+	return monitor->desired_id > monitor->cur_id++;
+}
+
+static bool update_monitor_info(struct window_area_capture *wc, obs_data_t *settings)
+{
+	struct monitor_info monitor = {0};
+
+	monitor.desired_id = (int)obs_data_get_int(settings, "monitor");
+
+	EnumDisplayMonitors(NULL, NULL, enum_monitor, (LPARAM)&monitor);
+
+	if (!monitor.handle)
+		return false;
+
+	wc->monitor = monitor.id;
+	wc->monitor_handle = monitor.handle;
+	wc->monitor_rect = monitor.rect;
+
+	const uint32_t monitor_width = (uint32_t)(monitor.rect.right - monitor.rect.left);
+
+	const uint32_t monitor_height = (uint32_t)(monitor.rect.bottom - monitor.rect.top);
+
+	if (wc->use_subregion) {
+		wc->desktop_width = (uint32_t)(wc->subregion_rect.right - wc->subregion_rect.left);
+
+		wc->desktop_height = (uint32_t)(wc->subregion_rect.bottom - wc->subregion_rect.top);
+	} else {
+		wc->desktop_width = monitor_width;
+		wc->desktop_height = monitor_height;
+	}
+
+	return true;
 }
 
 static const char *get_method_name(int method)
 {
-	const char *method_name = "";
 	switch (method) {
 	case METHOD_AUTO:
-		method_name = "Automatic";
-		break;
+		return "Automatic";
 	case METHOD_BITBLT:
-		method_name = "BitBlt";
-		break;
+		return "BitBlt";
 	case METHOD_WGC:
-		method_name = "WGC";
-		break;
+		return "WGC";
+	case METHOD_DXGI:
+		return "DXGI";
+	default:
+		return "Unknown";
+	}
+}
+
+static void init_monitor_bitblt(struct window_area_capture *wc)
+{
+	uint32_t width;
+	uint32_t height;
+	int x;
+	int y;
+
+	if (wc->use_subregion) {
+		x = wc->monitor_rect.left + wc->subregion_rect.left;
+
+		y = wc->monitor_rect.top + wc->subregion_rect.top;
+
+		width = (uint32_t)(wc->subregion_rect.right - wc->subregion_rect.left);
+
+		height = (uint32_t)(wc->subregion_rect.bottom - wc->subregion_rect.top);
+	} else {
+		x = wc->monitor_rect.left;
+		y = wc->monitor_rect.top;
+
+		width = (uint32_t)(wc->monitor_rect.right - wc->monitor_rect.left);
+
+		height = (uint32_t)(wc->monitor_rect.bottom - wc->monitor_rect.top);
 	}
 
-	return method_name;
+	dc_capture_init(&wc->capture, x, y, width, height, wc->cursor, wc->compatibility);
+}
+
+static bool create_desktop_dxgi(struct window_area_capture *wc)
+{
+	if (wc->duplicator)
+		return true;
+
+	if (!wc->monitor_handle)
+		return false;
+
+	const int dxgi_index = gs_duplicator_get_monitor_index(wc->monitor_handle);
+
+	if (dxgi_index < 0) {
+		blog(LOG_WARNING,
+		     "[window-area-capture: '%s'] "
+		     "DXGI monitor index not found",
+		     obs_source_get_name(wc->source));
+
+		return false;
+	}
+
+	wc->duplicator = gs_duplicator_create(dxgi_index);
+
+	if (!wc->duplicator) {
+		blog(LOG_WARNING,
+		     "[window-area-capture: '%s'] "
+		     "Failed to create DXGI duplicator",
+		     obs_source_get_name(wc->source));
+
+		return false;
+	}
+
+	wc->duplicator_retry_wait = false;
+	wc->duplicator_reset_timer = 0.0f;
+
+	return true;
+}
+
+static void free_desktop_dxgi(struct window_area_capture *wc)
+{
+	if (wc->duplicator) {
+		gs_duplicator_destroy(wc->duplicator);
+		wc->duplicator = NULL;
+	}
+
+	cursor_data_free(&wc->cursor_data);
+
+	wc->duplicator_width = 0;
+	wc->duplicator_height = 0;
+
+	wc->monitor_x = 0;
+	wc->monitor_y = 0;
+	wc->monitor_rotation = 0;
+}
+
+extern bool graphics_uses_d3d11;
+
+static bool desktop_dxgi_supported(struct window_area_capture *wc)
+{
+	if (!graphics_uses_d3d11 || !wc->monitor_handle)
+		return false;
+
+	int dxgi_index;
+
+	obs_enter_graphics();
+
+	dxgi_index = gs_duplicator_get_monitor_index(wc->monitor_handle);
+
+	obs_leave_graphics();
+
+	return dxgi_index >= 0;
+}
+
+static void reset_desktop_dxgi_info(struct window_area_capture *wc)
+{
+	if (!wc->duplicator)
+		return;
+
+	gs_texture_t *texture = gs_duplicator_get_texture(wc->duplicator);
+
+	if (texture) {
+		wc->duplicator_width = gs_texture_get_width(texture);
+
+		wc->duplicator_height = gs_texture_get_height(texture);
+	}
+
+	const int dxgi_index = gs_duplicator_get_monitor_index(wc->monitor_handle);
+
+	if (dxgi_index >= 0) {
+		struct gs_monitor_info monitor_info = {0};
+
+		if (gs_get_duplicator_monitor_info(dxgi_index, &monitor_info)) {
+			wc->monitor_x = monitor_info.x;
+			wc->monitor_y = monitor_info.y;
+			wc->monitor_rotation = monitor_info.rotation_degrees;
+		}
+	}
+}
+
+static void render_desktop_dxgi(struct window_area_capture *wc)
+{
+	if (!wc->duplicator)
+		return;
+
+	gs_texture_t *texture = gs_duplicator_get_texture(wc->duplicator);
+
+	if (!texture)
+		return;
+
+	uint32_t crop_x = 0;
+	uint32_t crop_y = 0;
+	uint32_t crop_width = wc->duplicator_width;
+	uint32_t crop_height = wc->duplicator_height;
+
+	if (wc->use_subregion) {
+		crop_x = (uint32_t)wc->subregion_rect.left;
+
+		crop_y = (uint32_t)wc->subregion_rect.top;
+
+		crop_width = wc->desktop_width;
+
+		crop_height = wc->desktop_height;
+	}
+
+	if (crop_x >= wc->duplicator_width || crop_y >= wc->duplicator_height)
+		return;
+
+	if (crop_width > wc->duplicator_width - crop_x) {
+		crop_width = wc->duplicator_width - crop_x;
+	}
+
+	if (crop_height > wc->duplicator_height - crop_y) {
+		crop_height = wc->duplicator_height - crop_y;
+	}
+
+	const bool previous_srgb = gs_framebuffer_srgb_enabled();
+
+	gs_enable_framebuffer_srgb(true);
+	gs_enable_blending(false);
+
+	gs_effect_t *opaque_effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
+
+	gs_eparam_t *image_param = gs_effect_get_param_by_name(opaque_effect, "image");
+
+	gs_effect_set_texture_srgb(image_param, texture);
+
+	while (gs_effect_loop(opaque_effect, "Draw")) {
+		gs_draw_sprite_subregion(texture, 0, crop_x, crop_y, crop_width, crop_height);
+	}
+
+	gs_enable_blending(true);
+	gs_enable_framebuffer_srgb(previous_srgb);
+
+	if (wc->cursor) {
+		gs_effect_t *cursor_effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+
+		while (gs_effect_loop(cursor_effect, "Draw")) {
+			cursor_draw(&wc->cursor_data,
+				    -wc->monitor_x - (long)crop_x,
+				    -wc->monitor_y - (long)crop_y,
+				    (long)crop_width, (long)crop_height);
+		}
+	}
 }
 
 static void log_settings(struct window_area_capture *wc, obs_data_t *s)
@@ -318,14 +566,39 @@ static void update_settings(struct window_area_capture *wc, obs_data_t *s)
 		memset(&wc->subregion_rect, 0, sizeof(wc->subregion_rect));
 
 	if (wc->desktop_monitor) {
+		/*
 		wc->monitor = (int)obs_data_get_int(s, "monitor");
 		wc->method = METHOD_BITBLT;
 		dc_capture_free(&wc->capture);
 		update_monitor(wc, s);
+		*/
 
 		if (wc->capture_winrt) {
 		wc->exports.winrt_capture_free(wc->capture_winrt);
 		wc->capture_winrt = NULL;
+		}
+
+		obs_enter_graphics();
+
+		free_desktop_dxgi(wc);
+		dc_capture_free(&wc->capture);
+
+		obs_leave_graphics();
+
+		if (update_monitor_info(wc, s) && desktop_dxgi_supported(wc)) {
+			wc->method = METHOD_DXGI;
+
+			wc->duplicator_retry_wait = false;
+			wc->duplicator_reset_timer = 0.0f;
+		} else {
+			wc->method = METHOD_BITBLT;
+
+			wc->duplicator_retry_wait = false;
+			wc->duplicator_reset_timer = 0.0f;
+
+			obs_enter_graphics();
+			init_monitor_bitblt(wc);
+			obs_leave_graphics();
 		}
 
 		memset(&wc->last_rect, 0, sizeof(wc->last_rect));
@@ -341,9 +614,16 @@ static void update_settings(struct window_area_capture *wc, obs_data_t *s)
 			calldata_free(&data);
 		}		
 	} else {
-		int method = (int)obs_data_get_int(s, "method");
+		obs_enter_graphics();
+		free_desktop_dxgi(wc);
+		obs_leave_graphics();
+
+		wc->monitor_handle = NULL;
+		memset(&wc->monitor_rect, 0, sizeof(wc->monitor_rect));
+
+		const int method = (int)obs_data_get_int(s, "method");
 		const char *window = obs_data_get_string(s, "window");
-		int priority = (int)obs_data_get_int(s, "priority");
+		const int priority = (int)obs_data_get_int(s, "priority");
 
 		bfree(wc->title);
 		bfree(wc->class);
@@ -352,7 +632,7 @@ static void update_settings(struct window_area_capture *wc, obs_data_t *s)
 		ms_build_window_strings(window, &wc->class, &wc->title,
 					&wc->executable);
 
-		wc->method = choose_method(method, wgc_supported, wc->class,
+		wc->method = choose_method((enum window_area_capture_method)method, wgc_supported, wc->class,
 					   wc->executable);
 		wc->priority = (enum window_priority)priority;
 		wc->force_sdr = obs_data_get_bool(s, "force_sdr");
@@ -436,6 +716,10 @@ static void *wc_create(obs_data_t *settings, obs_source_t *source)
 	struct window_area_capture *wc = bzalloc(sizeof(struct window_area_capture));
 	wc->source = source;
 
+	wc->duplicator = NULL;
+	wc->duplicator_retry_wait = false;
+	wc->duplicator_reset_timer = 0.0f;
+
 	pthread_mutex_init(&wc->update_mutex, NULL);
 
 	if (graphics_uses_d3d11) {
@@ -500,9 +784,13 @@ static void wc_actual_destroy(void *data)
 
 	if (wc->capture_winrt) {
 		wc->exports.winrt_capture_free(wc->capture_winrt);
+
+		wc->capture_winrt = NULL;
 	}
 
 	obs_enter_graphics();
+
+	free_desktop_dxgi(wc);
 	dc_capture_free(&wc->capture);
 	obs_leave_graphics();
 
@@ -551,30 +839,34 @@ static uint32_t wc_width(void *data)
 {
 	struct window_area_capture *wc = data;
 
-	if (wc->desktop_monitor)
+	if (wc->desktop_monitor) {
+		if (wc->method == METHOD_DXGI)
+			return wc->desktop_width;
+
 		return wc->capture.width;
+	}
 
 	if (!window_normal(wc))
 		return 0;
 
-	return (wc->method == METHOD_WGC)
-		       ? wc->exports.winrt_capture_width(wc->capture_winrt)
-		       : wc->capture.width;
+	return wc->method == METHOD_WGC ? wc->exports.winrt_capture_width(wc->capture_winrt) : wc->capture.width;
 }
 
 static uint32_t wc_height(void *data)
 {
 	struct window_area_capture *wc = data;
 
-	if (wc->desktop_monitor)
+	if (wc->desktop_monitor) {
+		if (wc->method == METHOD_DXGI)
+			return wc->desktop_height;
+
 		return wc->capture.height;
+	}
 
 	if (!window_normal(wc))
 		return 0;
 
-	return (wc->method == METHOD_WGC)
-		       ? wc->exports.winrt_capture_height(wc->capture_winrt)
-		       : wc->capture.height;
+	return wc->method == METHOD_WGC ? wc->exports.winrt_capture_height(wc->capture_winrt) : wc->capture.height;
 }
 
 static void wc_defaults(obs_data_t *defaults)
@@ -719,7 +1011,17 @@ static void wc_hide(void *data)
 
 	if (wc->capture_winrt) {
 		wc->exports.winrt_capture_free(wc->capture_winrt);
+
 		wc->capture_winrt = NULL;
+	}
+
+	if (wc->desktop_monitor && wc->method == METHOD_DXGI) {
+		obs_enter_graphics();
+		free_desktop_dxgi(wc);
+
+		wc->duplicator_retry_wait = false;
+		wc->duplicator_reset_timer = 0.0f;
+		obs_leave_graphics();
 	}
 
 	memset(&wc->last_rect, 0, sizeof(wc->last_rect));
@@ -727,11 +1029,14 @@ static void wc_hide(void *data)
 	if (wc->hooked) {
 		wc->hooked = false;
 
-		signal_handler_t *sh =
-			obs_source_get_signal_handler(wc->source);
+		signal_handler_t *sh = obs_source_get_signal_handler(wc->source);
+
 		calldata_t data = {0};
+
 		calldata_set_ptr(&data, "source", wc->source);
+
 		signal_handler_signal(sh, "unhooked", &data);
+
 		calldata_free(&data);
 	}
 }
@@ -745,13 +1050,65 @@ static void wc_tick(void *data, float seconds)
 	if (!obs_source_showing(wc->source))
 		return;
 	if (wc->desktop_monitor) {
-		if (!obs_source_showing(wc->source))
-			return;
-
 		obs_enter_graphics();
-		dc_capture_capture(&wc->capture, NULL);
+
+		if (wc->method == METHOD_DXGI) {
+			if (!wc->duplicator) {
+				bool should_create = false;
+
+				if (!wc->duplicator_retry_wait) {
+					should_create = true;
+				} else {
+					wc->duplicator_reset_timer += seconds;
+
+					if (wc->duplicator_reset_timer >= DXGI_RESET_INTERVAL) {
+						should_create = true;
+					}
+				}
+
+				if (should_create) {
+					if (!create_desktop_dxgi(wc)) {
+						wc->duplicator_retry_wait = true;
+						wc->duplicator_reset_timer = 0.0f;
+					}
+				}
+			}
+
+			if (wc->duplicator) {
+				if (wc->cursor) {
+					cursor_capture(&wc->cursor_data);
+				}
+
+				if (!gs_duplicator_update_frame(wc->duplicator)) {
+					free_desktop_dxgi(wc);
+
+					wc->duplicator_retry_wait = true;
+					wc->duplicator_reset_timer = 0.0f;
+				} else if (wc->duplicator_width == 0 || wc->duplicator_height == 0) {
+					reset_desktop_dxgi_info(wc);
+
+					if (wc->monitor_rotation != 0) {
+						blog(LOG_WARNING,
+						     "[window-area-capture: '%s'] "
+						     "Rotated monitor uses "
+						     "BitBlt fallback",
+						     obs_source_get_name(wc->source));
+
+						free_desktop_dxgi(wc);
+
+						wc->duplicator_retry_wait = false;
+						wc->duplicator_reset_timer = 0.0f;
+
+						wc->method = METHOD_BITBLT;
+						init_monitor_bitblt(wc);
+					}
+				}
+			}
+		} else {
+			dc_capture_capture(&wc->capture, NULL);
+		}
+
 		obs_leave_graphics();
-		UNUSED_PARAMETER(seconds);
 		return;
 	}
 	if (!wc->window || !IsWindow(wc->window)) {
@@ -995,29 +1352,70 @@ static void wc_tick(void *data, float seconds)
 	obs_leave_graphics();
 }
 
+static void wc_show(void *data)
+{
+	struct window_area_capture *wc = data;
+
+	if (!wc->desktop_monitor || wc->method != METHOD_DXGI || wc->duplicator) {
+		return;
+	}
+
+	obs_enter_graphics();
+
+	if (!create_desktop_dxgi(wc)) {
+		wc->duplicator_retry_wait = true;
+		wc->duplicator_reset_timer = 0.0f;
+
+		obs_leave_graphics();
+		return;
+	}
+
+	if (!gs_duplicator_update_frame(wc->duplicator)) {
+		free_desktop_dxgi(wc);
+
+		wc->duplicator_retry_wait = true;
+		wc->duplicator_reset_timer = 0.0f;
+	} else {
+		reset_desktop_dxgi_info(wc);
+
+		if (wc->cursor) {
+			cursor_capture(&wc->cursor_data);
+		}
+	}
+
+	obs_leave_graphics();
+}
+
 static void wc_render(void *data, gs_effect_t *effect)
 {
 	struct window_area_capture *wc = data;
 
-	if (!wc->desktop_monitor && !window_normal(wc))
+	if (wc->desktop_monitor) {
+		if (wc->method == METHOD_DXGI) {
+			render_desktop_dxgi(wc);
+		} else {
+			dc_capture_render(&wc->capture, obs_source_get_texcoords_centered(wc->source));
+		}
+
+		UNUSED_PARAMETER(effect);
+		return;
+	}
+
+	if (!window_normal(wc))
 		return;
 
 	if (wc->method == METHOD_WGC) {
 		if (wc->capture_winrt) {
-			if (wc->exports.winrt_capture_active(
-				    wc->capture_winrt)) {
-				wc->exports.winrt_capture_render(
-					wc->capture_winrt);
+			if (wc->exports.winrt_capture_active(wc->capture_winrt)) {
+				wc->exports.winrt_capture_render(wc->capture_winrt);
 			} else {
-				wc->exports.winrt_capture_free(
-					wc->capture_winrt);
+				wc->exports.winrt_capture_free(wc->capture_winrt);
+
 				wc->capture_winrt = NULL;
 			}
 		}
 	} else {
-		dc_capture_render(
-			&wc->capture,
-			obs_source_get_texcoords_centered(wc->source));
+		dc_capture_render(&wc->capture, obs_source_get_texcoords_centered(wc->source));
 	}
 
 	UNUSED_PARAMETER(effect);
@@ -1031,16 +1429,18 @@ wc_area_get_color_space(void *data, size_t count,
 
 	enum gs_color_space capture_space = GS_CS_SRGB;
 
-	if ((wc->method == METHOD_WGC) && wc->capture_winrt) {
-		capture_space = wc->exports.winrt_capture_get_color_space(
-			wc->capture_winrt);
+	if (wc->desktop_monitor && wc->method == METHOD_DXGI && wc->duplicator && !wc->force_sdr) {
+		capture_space = gs_duplicator_get_color_space(wc->duplicator);
+	} else if (wc->method == METHOD_WGC && wc->capture_winrt) {
+		capture_space = wc->exports.winrt_capture_get_color_space(wc->capture_winrt);
 	}
 
 	enum gs_color_space space = capture_space;
+
 	for (size_t i = 0; i < count; ++i) {
-		const enum gs_color_space preferred_space = preferred_spaces[i];
-		space = preferred_space;
-		if (preferred_space == capture_space)
+		space = preferred_spaces[i];
+
+		if (preferred_spaces[i] == capture_space)
 			break;
 	}
 
@@ -1057,6 +1457,7 @@ struct obs_source_info window_area_capture_info = {
 	.destroy = wc_destroy,
 	.update = wc_update,
 	.video_render = wc_render,
+	.show = wc_show,
 	.hide = wc_hide,
 	.video_tick = wc_tick,
 	.get_width = wc_width,
