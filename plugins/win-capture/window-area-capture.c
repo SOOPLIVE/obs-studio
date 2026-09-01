@@ -19,15 +19,15 @@
 /* clang-format off */
 
 #define TEXT_WINDOW_AREA_CAPTURE obs_module_text("WindowAreaCapture")
-#define TEXT_WINDOW         obs_module_text("WindowAreaCapture.Window")
-#define TEXT_METHOD         obs_module_text("WindowAreaCapture.Method")
-#define TEXT_METHOD_AUTO    obs_module_text("WindowAreaCapture.Method.Auto")
-#define TEXT_METHOD_BITBLT  obs_module_text("WindowAreaCapture.Method.BitBlt")
-#define TEXT_METHOD_WGC     obs_module_text("WindowAreaCapture.Method.WindowsGraphicsCapture")
-#define TEXT_MATCH_PRIORITY obs_module_text("WindowAreaCapture.Priority")
-#define TEXT_MATCH_TITLE    obs_module_text("WindowAreaCapture.Priority.Title")
-#define TEXT_MATCH_CLASS    obs_module_text("WindowAreaCapture.Priority.Class")
-#define TEXT_MATCH_EXE      obs_module_text("WindowAreaCapture.Priority.Exe")
+#define TEXT_WINDOW         obs_module_text("WindowCapture.Window")
+#define TEXT_METHOD         obs_module_text("WindowCapture.Method")
+#define TEXT_METHOD_AUTO    obs_module_text("WindowCapture.Method.Auto")
+#define TEXT_METHOD_BITBLT  obs_module_text("WindowCapture.Method.BitBlt")
+#define TEXT_METHOD_WGC     obs_module_text("WindowCapture.Method.WindowsGraphicsCapture")
+#define TEXT_MATCH_PRIORITY obs_module_text("WindowCapture.Priority")
+#define TEXT_MATCH_TITLE    obs_module_text("WindowCapture.Priority.Title")
+#define TEXT_MATCH_CLASS    obs_module_text("WindowCapture.Priority.Class")
+#define TEXT_MATCH_EXE      obs_module_text("WindowCapture.Priority.Exe")
 #define TEXT_CAPTURE_CURSOR obs_module_text("CaptureCursor")
 #define TEXT_COMPATIBILITY  obs_module_text("Compatibility")
 #define TEXT_CLIENT_AREA    obs_module_text("ClientArea")
@@ -968,7 +968,13 @@ static obs_properties_t *wc_properties(void *data)
 	ms_fill_window_list(p, EXCLUDE_MINIMIZED, NULL);
 	obs_property_set_modified_callback(p, wc_window_changed);
 	obs_property_set_visible(p, false);
-		
+
+	p = obs_properties_add_text(
+		ppts,
+		"capture_window",
+		TEXT_WINDOW,
+		OBS_TEXT_INFO);
+
 	p = obs_properties_add_list(ppts, "method", TEXT_METHOD,
 				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, TEXT_METHOD_AUTO, METHOD_AUTO);
@@ -976,7 +982,6 @@ static obs_properties_t *wc_properties(void *data)
 	obs_property_list_add_int(p, TEXT_METHOD_WGC, METHOD_WGC);
 	obs_property_list_item_disable(p, 2, !wgc_supported);
 	obs_property_set_modified_callback(p, wc_capture_method_changed);
-	obs_property_set_visible(p, false);
 
 	p = obs_properties_add_list(ppts, "priority", TEXT_MATCH_PRIORITY,
 				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);

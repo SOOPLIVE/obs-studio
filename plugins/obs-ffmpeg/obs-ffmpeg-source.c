@@ -629,8 +629,8 @@ static void *ffmpeg_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct ffmpeg_source *s = bzalloc(sizeof(struct ffmpeg_source));
 	s->source = source;
-#pragma region
-	obs_source_set_monitoring_type(source, OBS_MONITORING_TYPE_AUTO);
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+	soop_source_set_monitoring_type(source);
 #pragma endregion
 	// Manual type since the event can be signalled without an active thread
 	if (os_event_init(&s->reconnect_stop_event, OS_EVENT_TYPE_MANUAL)) {

@@ -1293,13 +1293,15 @@ enum obs_monitoring_type {
 	OBS_MONITORING_TYPE_NONE,
 	OBS_MONITORING_TYPE_MONITOR_ONLY,
 	OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT,
-#pragma region _SOOP_MONITORING_TYPE_AUTO
-	OBS_MONITORING_TYPE_AUTO, // OBS_MONITORING_TYPE_MONITOR_ONLY or OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT (UI 에서는 지원하지 않기 때문에 초기 값으로만 사용해야 함)
-#pragma endregion
 };
 
 EXPORT void obs_source_set_monitoring_type(obs_source_t *source, enum obs_monitoring_type type);
 EXPORT enum obs_monitoring_type obs_source_get_monitoring_type(const obs_source_t *source);
+
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+EXPORT void soop_source_set_monitoring_type(obs_source_t* source);
+EXPORT int soop_source_get_monitoring_type(const char* id);
+#pragma endregion
 
 /** Gets private front-end settings data.  This data is saved/loaded
  * automatically.  Returns an incremented reference. */

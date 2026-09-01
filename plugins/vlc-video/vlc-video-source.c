@@ -999,9 +999,6 @@ static void *vlcs_create(obs_data_t *settings, obs_source_t *source)
 	struct vlc_source *c = bzalloc(sizeof(*c));
 	c->is_first_frame = false;
 	c->source = source;
-#pragma region _SOOP_MONITORING_TYPE_AUTO
-	obs_source_set_monitoring_type(source, OBS_MONITORING_TYPE_AUTO);
-#pragma endregion
 	c->play_pause_hotkey = obs_hotkey_register_source(source, "VLCSource.PlayPause", obs_module_text("PlayPause"),
 							  vlcs_play_pause_hotkey, c);
 

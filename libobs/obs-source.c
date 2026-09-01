@@ -5471,7 +5471,7 @@ void obs_source_remove_audio_capture_callback(obs_source_t *source, obs_source_a
 	pthread_mutex_unlock(&source->audio_cb_mutex);
 }
 
-extern bool devices_match(const char *id1, const char *id2); // 장치 ID 가 "default" 인 경우 처리 가능
+extern bool devices_match(const char *id1, const char *id2);
 
 void obs_source_set_monitoring_type(obs_source_t *source, enum obs_monitoring_type type)
 {
@@ -5502,39 +5502,6 @@ void obs_source_set_monitoring_type(obs_source_t *source, enum obs_monitoring_ty
 			source->monitor = NULL;
 		}
 	}
-#pragma region _SOOP_MONITORING_TYPE_AUTO
-	if (type == OBS_MONITORING_TYPE_AUTO) {
-		type = OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT; // 모니터링 및 방송 출력
-
-		struct obs_view *view = &obs->data.main_view;
-		pthread_mutex_lock(&view->channels_mutex);
-
-		if ((view->channels[1] == 0) &&
-		    (view->channels[2] == 0)) // 데스크탑 오디오 사용 안 함
-		{
-			if ((view->channels[3] != 0) ||
-			    (view->channels[4] != 0) ||
-			    (view->channels[5] != 0) ||
-			    (view->channels[6] !=
-			     0)) // 마이크/Aux 오디오 사용 (모니터링 오디오가 믹싱되서 방송으로 출력되는 경우가 많음)
-				type = OBS_MONITORING_TYPE_MONITOR_ONLY; // 방송 출력 없이 모니터링
-		} else {
-			for (size_t i = 1; i < 3; i++) {
-				if (view->channels[i] == 0)
-					continue;
-
-				obs_data_addref(view->channels[i]->context.settings); // obs_source_get_settings
-				const char *id = obs_data_get_string(view->channels[i]->context.settings, "device_id");
-				if (devices_match(id, obs->audio.monitoring_device_id)) // 데스크탑 오디오와 모니터링 장치가 동일 (모니터링 오디오가 방송으로 출력)
-					type = OBS_MONITORING_TYPE_MONITOR_ONLY; // 방송 출력 없이 모니터링
-
-				obs_data_release(view->channels[i]->context.settings);
-			}
-		}
-
-		pthread_mutex_unlock(&view->channels_mutex);
-	}
-#pragma endregion
 	source->monitoring_type = type;
 }
 
@@ -5543,6 +5510,94 @@ enum obs_monitoring_type obs_source_get_monitoring_type(const obs_source_t *sour
 	return obs_source_valid(source, "obs_source_get_monitoring_type") ? source->monitoring_type
 									  : OBS_MONITORING_TYPE_NONE;
 }
+
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+void soop_source_set_monitoring_type(obs_source_t* source)
+{
+	if (source) {
+		const char* id = obs_source_get_id(source);
+		if (id) {
+			int type = soop_source_get_monitoring_type(id);
+			if ((type >= (int)OBS_MONITORING_TYPE_NONE) &&
+				(type <= (int)OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT))
+				obs_source_set_monitoring_type(source, type);
+		}
+	}
+}
+
+extern bool devices_match(const char* id1, const char* id2);
+
+enum obs_monitoring_type soop_desktop_audio_monitoring_type()
+{
+	enum obs_monitoring_type type = OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT;
+
+	//
+
+	for (uint32_t i = 1; i < 3; i++)
+	{
+		obs_source_t* source = obs_get_output_source(i);
+		if (source) {
+			obs_data_t* settings = obs_source_get_settings(source);
+			if (settings) {
+				const char* device_id = obs_data_get_string(settings, "device_id");
+				const char* name = 0;
+				const char* id = 0;
+				obs_get_audio_monitoring_device(&name, &id);
+				if (device_id && id) {
+					if (devices_match(
+						device_id,
+						id))
+						type = OBS_MONITORING_TYPE_MONITOR_ONLY;
+				}
+
+				obs_data_release(settings);
+			}
+
+			obs_source_release(source);
+		}
+	}
+
+	//
+
+	return type;
+}
+
+int soop_source_get_monitoring_type(const char* id)
+{
+	int monitoring_type = -1;
+
+	//
+
+	if (id) {
+		if (!strcmp(id, "game_capture") ||
+			!strcmp(id, "window_capture") ||
+			!strcmp(id, "wasapi_process_output_capture"))
+			monitoring_type = OBS_MONITORING_TYPE_NONE;
+		else if (!strcmp(id, "aja_source") ||
+			!strcmp(id, "decklink-input") ||
+			!strcmp(id, "dshow_input") ||
+			!strcmp(id, "wasapi_input_capture") ||
+			!strcmp(id, "wasapi_output_capture")) 
+			monitoring_type = (int)OBS_MONITORING_TYPE_NONE;
+		else if (!strcmp(id, "obs_stinger_transition")) 
+			monitoring_type = (int)soop_desktop_audio_monitoring_type();
+		else {
+			const struct obs_source_info* info = get_source_info(id);
+			if (info) {
+				if (info->type == OBS_SOURCE_TYPE_INPUT) {
+					uint32_t flags = obs_get_source_output_flags(id);
+					if (flags & OBS_SOURCE_AUDIO)
+						monitoring_type = soop_desktop_audio_monitoring_type();
+				}
+			}
+		}
+	}
+
+	//
+
+	return monitoring_type;
+}
+#pragma endregion
 
 void obs_source_set_async_unbuffered(obs_source_t *source, bool unbuffered)
 {

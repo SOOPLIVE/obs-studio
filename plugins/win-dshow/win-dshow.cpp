@@ -1215,10 +1215,6 @@ static void *CreateDShowInput(obs_data_t *settings, obs_source_t *source)
 
 	try {
 		dshow = new DShowInput(source, settings);
-#pragma region _SOOP_MONITORING_TYPE_AUTO
-		obs_source_set_monitoring_type(source, OBS_MONITORING_TYPE_AUTO);
-#pragma endregion
-
 		proc_handler_t* ph = obs_source_get_proc_handler(source);
 		proc_handler_add(ph, "void activate(bool active)", proc_activate, dshow);
 	}

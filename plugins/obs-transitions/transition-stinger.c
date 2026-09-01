@@ -163,9 +163,6 @@ static void *stinger_create(obs_data_t *settings, obs_source_t *source)
 	struct stinger_info *s = bzalloc(sizeof(*s));
 
 	s->source = source;
-#pragma region _SOOP_MONITORING_TYPE_AUTO
-	obs_source_set_monitoring_type(source, OBS_MONITORING_TYPE_AUTO);
-#pragma endregion
 	s->mix_a = mix_a_fade_in_out;
 	s->mix_b = mix_b_fade_in_out;
 

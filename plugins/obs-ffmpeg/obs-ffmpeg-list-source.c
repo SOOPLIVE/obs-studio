@@ -697,8 +697,8 @@ static void *ffmpeg_list_source_create(obs_data_t *settings, obs_source_t *sourc
 {
 	struct ffmpeg_list_source *s = bzalloc(sizeof(struct ffmpeg_list_source));
 	s->source = source;
-#pragma region
-	obs_source_set_monitoring_type(source, OBS_MONITORING_TYPE_AUTO);
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+	soop_source_set_monitoring_type(source);
 #pragma endregion
 	proc_handler_t *ph = obs_source_get_proc_handler(source);
 	proc_handler_add(ph, "void restart()", restart_proc, s);
