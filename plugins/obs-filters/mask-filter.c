@@ -152,7 +152,6 @@ static void mask_filter_update_internal(void *data, obs_data_t *settings, float 
 	}
 	else {
 		filter->image_file = bstrdup(path);
-		filter->color.w = opacity;
 		effect_path = obs_module_file(effect_file);
 	}
 
@@ -160,7 +159,8 @@ static void mask_filter_update_internal(void *data, obs_data_t *settings, float 
 		vec4_from_rgba_srgb(&filter->color, color);
 	else
 		vec4_from_rgba(&filter->color, color);
-	filter->color.w = opacity;
+
+	filter->color.w = filter->use_preset ? 1.0f : opacity;
 
 	mask_filter_image_load(filter);
 	filter->lock_aspect = !obs_data_get_bool(settings, SETTING_STRETCH);
@@ -217,7 +217,7 @@ static bool mask_filter_preset_clicked(obs_properties_t* props,
 	struct mask_filter_data* filter = data;
 	obs_data_t* settings = obs_source_get_settings(filter->context);
 
-	int button_idx = fs_property_image_button_group_item_idx(property);
+	int button_idx = fs_property_button_group_item_idx(property);
 	obs_data_set_int(settings, SETTING_PRESET_GROUP, button_idx);
 
 	return true;
@@ -282,38 +282,44 @@ static obs_properties_t *mask_filter_properties_internal(bool use_float_opacity)
 
 	{
 		obs_properties_t* image_buttons_group = obs_properties_create();
-		p = fs_properties_add_image_button_group_item(image_buttons_group,
+		p = fs_properties_add_button_group_item(image_buttons_group,
 			TEXT_MASK_PRESET_CIRCLE, TEXT_MASK_PRESET_CIRCLE, SETTING_PRESET_GROUP,
+			0, mask_filter_preset_clicked,
 			obs_module_file("masking_image/button/preset_mask_button_circle.svg"),
-			60, 60, 0, mask_filter_preset_clicked);
+			60, 60);
 
-		p = fs_properties_add_image_button_group_item(image_buttons_group,
+		p = fs_properties_add_button_group_item(image_buttons_group,
 			TEXT_MASK_PRESET_SQUARE, TEXT_MASK_PRESET_SQUARE, SETTING_PRESET_GROUP,
+			1, mask_filter_preset_clicked,
 			obs_module_file("masking_image/button/preset_mask_button_square.svg"),
-			60, 60, 1, mask_filter_preset_clicked);
+			60, 60);
 
-		p = fs_properties_add_image_button_group_item(image_buttons_group,
+		p = fs_properties_add_button_group_item(image_buttons_group,
 			TEXT_MASK_PRESET_HEART, TEXT_MASK_PRESET_HEART, SETTING_PRESET_GROUP,
+			2, mask_filter_preset_clicked,
 			obs_module_file("masking_image/button/preset_mask_button_heart.svg"),
-			60, 60, 2, mask_filter_preset_clicked);
+			60, 60);
 
-		p = fs_properties_add_image_button_group_item(image_buttons_group,
+		p = fs_properties_add_button_group_item(image_buttons_group,
 			TEXT_MASK_PRESET_TRIANGLE, TEXT_MASK_PRESET_TRIANGLE, SETTING_PRESET_GROUP,
+			3, mask_filter_preset_clicked,
 			obs_module_file("masking_image/button/preset_mask_button_triangle.svg"),
-			60, 60, 3, mask_filter_preset_clicked);
+			60, 60);
 
-		p = fs_properties_add_image_button_group_item(image_buttons_group,
+		p = fs_properties_add_button_group_item(image_buttons_group,
 			TEXT_MASK_PRESET_STAR, TEXT_MASK_PRESET_STAR, SETTING_PRESET_GROUP,
+			4, mask_filter_preset_clicked,
 			obs_module_file("masking_image/button/preset_mask_button_star.svg"),
-			60, 60, 4, mask_filter_preset_clicked);
+			60, 60);
 
-		p = fs_properties_add_image_button_group_item(image_buttons_group,
+		p = fs_properties_add_button_group_item(image_buttons_group,
 			TEXT_MASK_PRESET_HEXAGON, TEXT_MASK_PRESET_HEXAGON, SETTING_PRESET_GROUP,
+			5, mask_filter_preset_clicked,
 			obs_module_file("masking_image/button/preset_mask_button_hexagon.svg"),
-			60, 60, 5, mask_filter_preset_clicked);
+			60, 60);
 
-		p = fs_properties_add_image_button_group(props,
-			SETTING_PRESET_GROUP, TEXT_PRESET_GROUP, 6, image_buttons_group);
+		p = fs_properties_add_button_group(props, image_buttons_group,
+			SETTING_PRESET_GROUP, TEXT_PRESET_GROUP, 6, true);
 	}
 
 	obs_properties_add_path(props, SETTING_IMAGE_PATH, TEXT_IMAGE_PATH, OBS_PATH_FILE, filter_str.array, NULL);

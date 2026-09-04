@@ -16,6 +16,10 @@
 
 #include <algorithm>
 #include <limits>
+/* DSHOW Instance - BEGIN */
+#include <map>
+#include <memory>
+/* DSHOW Instance - END */
 #include <set>
 #include <string>
 #include <vector>
@@ -25,6 +29,14 @@
  *   - handle disconnections and reconnections
  *   - if device not present, wait for device to be plugged in
  */
+
+ /*
+  * DSHOW Instance MERGE GUIDE
+  *
+  * This file is based on OBS win-dshow.cpp. Keep OBS upstream code as close as
+  * possible to the original file. Custom changes for sharing a DirectShow video
+  * device across multiple OBS sources are marked with "DSHOW Instance" comments.
+  */
 
 #undef min
 #undef max
@@ -114,12 +126,13 @@ enum class BufferingType : int64_t {
 	Off,
 };
 
-void ffmpeg_log(void *bla, int level, const char *msg, va_list args)
+void ffmpeg_log(void* bla, int level, const char* msg, va_list args)
 {
 	DStr str;
 	if (level == AV_LOG_WARNING) {
 		dstr_copy(str, "warning: ");
-	} else if (level == AV_LOG_ERROR) {
+	}
+	else if (level == AV_LOG_ERROR) {
 		/* only print first of this message to avoid spam */
 		static bool suppress_app_field_spam = false;
 		if (strcmp(msg, "unable to decode APP fields: %s\n") == 0) {
@@ -130,9 +143,11 @@ void ffmpeg_log(void *bla, int level, const char *msg, va_list args)
 		}
 
 		dstr_copy(str, "error:   ");
-	} else if (level < AV_LOG_ERROR) {
+	}
+	else if (level < AV_LOG_ERROR) {
 		dstr_copy(str, "fatal:   ");
-	} else {
+	}
+	else {
 		return;
 	}
 
@@ -151,8 +166,8 @@ public:
 	inline Decoder() { memset(&decode, 0, sizeof(decode)); }
 	inline ~Decoder() { ffmpeg_decode_free(&decode); }
 
-	inline operator ffmpeg_decode *() { return &decode; }
-	inline ffmpeg_decode *operator->() { return &decode; }
+	inline operator ffmpeg_decode* () { return &decode; }
+	inline ffmpeg_decode* operator->() { return &decode; }
 };
 
 class CriticalSection {
@@ -162,17 +177,17 @@ public:
 	inline CriticalSection() { InitializeCriticalSection(&mutex); }
 	inline ~CriticalSection() { DeleteCriticalSection(&mutex); }
 
-	inline operator CRITICAL_SECTION *() { return &mutex; }
+	inline operator CRITICAL_SECTION* () { return &mutex; }
 };
 
 class CriticalScope {
-	CriticalSection &mutex;
+	CriticalSection& mutex;
 
 	CriticalScope() = delete;
-	CriticalScope &operator=(CriticalScope &cs) = delete;
+	CriticalScope& operator=(CriticalScope& cs) = delete;
 
 public:
-	inline CriticalScope(CriticalSection &mutex_) : mutex(mutex_) { EnterCriticalSection(mutex); }
+	inline CriticalScope(CriticalSection& mutex_) : mutex(mutex_) { EnterCriticalSection(mutex); }
 
 	inline ~CriticalScope() { LeaveCriticalSection(mutex); }
 };
@@ -189,18 +204,54 @@ enum class Action {
 	ConfigCrossbar2,
 };
 
-static DWORD CALLBACK DShowThread(LPVOID ptr);
+struct DShowInput;
+
+/* DSHOW Instance - BEGIN */
+class DShowInstance;
+class DShowInstanceManager;
+static DWORD CALLBACK DShowInstanceThread(LPVOID ptr);
+/* DSHOW Instance - END */
+
+#define FPS_HIGHEST 0LL
+#define FPS_MATCHING -1LL
+
+/* DSHOW Instance - BEGIN */
+/* Graph-level settings shared by all subscribers. */
+struct DShowInstanceSettings {
+	std::string videoDeviceId;
+
+	int resType = ResType_Preferred;
+	std::string resolution;
+	long long frameInterval = FPS_MATCHING;
+	VideoFormat videoFormat = VideoFormat::Any;
+
+	int buffering = (int)BufferingType::Auto;
+
+	std::string colorSpace = "default";
+	std::string colorRange = "default";
+
+	int audioOutputMode = (int)AudioMode::Capture;
+	bool useCustomAudio = false;
+	std::string audioDeviceId;
+};
+/* DSHOW Instance - END */
+
 
 struct DShowInput {
-	obs_source_t *source;
-	Device device;
+	obs_source_t* source;
+	/* DSHOW Instance - BEGIN */
+	/* Shared graph selected by VIDEO_DEVICE_ID. */
+	std::shared_ptr<DShowInstance> instance;
 	bool deactivateWhenNotShowing = false;
-	bool deviceHasAudio = false;
-	bool deviceHasSeparateAudioFilter = false;
+	bool showing = false;
+	/* DSHOW Instance - END */
 	bool flip = false;
 	bool active = false;
 	bool autorotation = true;
 	bool hw_decode = false;
+	int sharedAudioOutputMode = (int)AudioMode::Capture;
+	uint64_t appliedSharedSettingsVersion = 0;
+	bool destroying = false;
 	bool use_limitInterval = 0;
 	int  limitInterval = 0;
 	obs_source_frame2 limitFrame;
@@ -211,37 +262,19 @@ struct DShowInput {
 	Decoder video_decoder;
 
 	VideoConfig videoConfig;
-	AudioConfig audioConfig;
 
 	enum video_colorspace cs;
 	obs_source_frame2 frame;
 	obs_source_audio audio;
 	long lastRotation = 0;
 
-	WinHandle semaphore;
-	WinHandle activated_event;
-	WinHandle thread;
-	CriticalSection mutex;
-	vector<Action> actions;
+	/* DSHOW Instance - BEGIN */
+	/* Protects per-source buffers while shared callbacks are running. */
+	CriticalSection callbackMutex;
+	/* DSHOW Instance - END */
 
-	inline void QueueAction(Action action)
-	{
-		CriticalScope scope(mutex);
-		actions.push_back(action);
-		ReleaseSemaphore(semaphore, 1, nullptr);
-	}
 
-	inline void QueueActivate(obs_data_t *settings)
-	{
-		bool block = obs_data_get_bool(settings, "synchronous_activate");
-		QueueAction(block ? Action::ActivateBlock : Action::Activate);
-		if (block) {
-			obs_data_erase(settings, "synchronous_activate");
-			WaitForSingleObject(activated_event, INFINITE);
-		}
-	}
-
-	inline DShowInput(obs_source_t *source_, obs_data_t *settings) : source(source_), device(InitGraph::False)
+	inline DShowInput(obs_source_t* source_, obs_data_t* settings) : source(source_)
 	{
 		memset(&audio, 0, sizeof(audio));
 		memset(&frame, 0, sizeof(frame));
@@ -249,75 +282,57 @@ struct DShowInput {
 		av_log_set_level(AV_LOG_WARNING);
 		av_log_set_callback(ffmpeg_log);
 
-		semaphore = CreateSemaphore(nullptr, 0, 0x7FFFFFFF, nullptr);
-		if (!semaphore)
-			throw "Failed to create semaphore";
-
-		activated_event = CreateEvent(nullptr, false, false, nullptr);
-		if (!activated_event)
-			throw "Failed to create activated_event";
-
-		thread = CreateThread(nullptr, 0, DShowThread, this, 0, nullptr);
-		if (!thread)
-			throw "Failed to create thread";
-
+		/* DSHOW Instance - BEGIN */
 		deactivateWhenNotShowing = obs_data_get_bool(settings, DEACTIVATE_WNS);
+		showing = obs_source_showing(source);
+		/* DSHOW Instance - END */
 
 		if (obs_data_get_bool(settings, "active")) {
-			bool showing = obs_source_showing(source);
+			/* DSHOW Instance - BEGIN */
+			/* Set before QueueActivate() so the shared instance can check output state. */
+			active = true;
+
 			if (!deactivateWhenNotShowing || showing)
 				QueueActivate(settings);
-
-			active = true;
+			/* DSHOW Instance - END */
 		}
 	}
 
 	inline ~DShowInput()
 	{
+		/* DSHOW Instance - BEGIN */
+		/* Unsubscribe before per-source buffers are destroyed. */
+		destroying = true;
+		Deactivate();
+
+		/* Wait until any in-flight OnVideoData()/OnAudioData() call has
+		 * left before Decoder/frame/audio members are destroyed. */
 		{
-			CriticalScope scope(mutex);
-			actions.resize(1);
-			actions[0] = Action::Shutdown;
+			CriticalScope callbackScope(callbackMutex);
 		}
-
-		ReleaseSemaphore(semaphore, 1, nullptr);
-
-		WaitForSingleObject(thread, INFINITE);
+		/* DSHOW Instance - END */
 	}
 
-	void OnEncodedVideoData(enum AVCodecID id, unsigned char *data, size_t size, long long ts);
-	void OnEncodedAudioData(enum AVCodecID id, unsigned char *data, size_t size, long long ts);
+	void OnEncodedVideoData(enum AVCodecID id, unsigned char* data, size_t size, long long ts);
+	void OnEncodedAudioData(enum AVCodecID id, unsigned char* data, size_t size, long long ts);
 
-	void OnReactivate();
-	void OnVideoData(const VideoConfig &config, unsigned char *data, size_t size, long long startTime,
-			 long long endTime, long rotation);
-	void OnAudioData(const AudioConfig &config, unsigned char *data, size_t size, long long startTime,
-			 long long endTime);
+	void OnVideoData(const VideoConfig& config, unsigned char* data, size_t size, long long startTime,
+		long long endTime, long rotation);
+	void OnAudioData(const AudioConfig& config, unsigned char* data, size_t size, long long startTime,
+		long long endTime);
 
-	bool UpdateVideoConfig(obs_data_t *settings);
-	bool UpdateAudioConfig(obs_data_t *settings);
 	void SetActive(bool active);
-	inline enum video_colorspace GetColorSpace(obs_data_t *settings) const;
-	inline enum video_range_type GetColorRange(obs_data_t *settings) const;
-	inline bool Activate(obs_data_t *settings);
+	inline enum video_colorspace GetColorSpace(obs_data_t* settings) const;
+	inline enum video_range_type GetColorRange(obs_data_t* settings) const;
+	inline void QueueActivate(obs_data_t* settings);
 	inline void Deactivate();
 
-	inline void SetupBuffering(obs_data_t *settings);
-
-	void DShowLoop();
+	inline void SetupBuffering(obs_data_t* settings);
+	/* DSHOW Instance - BEGIN */
+	void SyncSourceConfig(obs_data_t* settings, const VideoConfig& config);
+	void SyncSourceConfig(const DShowInstanceSettings& settings, const VideoConfig& config);
+	/* DSHOW Instance - END */
 };
-
-static DWORD CALLBACK DShowThread(LPVOID ptr)
-{
-	DShowInput *dshowInput = (DShowInput *)ptr;
-
-	os_set_thread_name("win-dshow: DShowThread");
-
-	CoInitialize(nullptr);
-	dshowInput->DShowLoop();
-	CoUninitialize();
-	return 0;
-}
 
 static inline void ProcessMessages()
 {
@@ -328,95 +343,27 @@ static inline void ProcessMessages()
 	}
 }
 
-/* Always keep directshow in a single thread for a given device */
-void DShowInput::DShowLoop()
-{
-	while (true) {
-		DWORD ret = MsgWaitForMultipleObjects(1, &semaphore, false, INFINITE, QS_ALLINPUT);
-		if (ret == (WAIT_OBJECT_0 + 1)) {
-			ProcessMessages();
-			continue;
-		} else if (ret != WAIT_OBJECT_0) {
-			break;
-		}
 
-		Action action = Action::None;
-		{
-			CriticalScope scope(mutex);
-			if (actions.size()) {
-				action = actions.front();
-				actions.erase(actions.begin());
-			}
-		}
-
-		switch (action) {
-		case Action::Activate:
-		case Action::ActivateBlock: {
-			bool block = action == Action::ActivateBlock;
-
-			obs_data_t *settings;
-			settings = obs_source_get_settings(source);
-			if (!Activate(settings)) {
-				obs_source_output_video2(source, nullptr);
-			}
-			if (block)
-				SetEvent(activated_event);
-			obs_data_release(settings);
-			break;
-		}
-
-		case Action::Deactivate:
-			Deactivate();
-			break;
-
-		case Action::Shutdown:
-			device.ShutdownGraph();
-			return;
-
-		case Action::ConfigVideo:
-			device.OpenDialog(nullptr, DialogType::ConfigVideo);
-			break;
-
-		case Action::ConfigAudio:
-			device.OpenDialog(nullptr, DialogType::ConfigAudio);
-			break;
-
-		case Action::ConfigCrossbar1:
-			device.OpenDialog(nullptr, DialogType::ConfigCrossbar);
-			break;
-
-		case Action::ConfigCrossbar2:
-			device.OpenDialog(nullptr, DialogType::ConfigCrossbar2);
-			break;
-
-		case Action::None:;
-		}
-	}
-}
-
-#define FPS_HIGHEST 0LL
-#define FPS_MATCHING -1LL
-
-template<typename T, typename U, typename V> static bool between(T &&lower, U &&value, V &&upper)
+template<typename T, typename U, typename V> static bool between(T&& lower, U&& value, V&& upper)
 {
 	return value >= lower && value <= upper;
 }
 
-static bool ResolutionAvailable(const VideoInfo &cap, int cx, int cy)
+static bool ResolutionAvailable(const VideoInfo& cap, int cx, int cy)
 {
 	return between(cap.minCX, cx, cap.maxCX) && between(cap.minCY, cy, cap.maxCY);
 }
 
 #define DEVICE_INTERVAL_DIFF_LIMIT 20
 
-static bool FrameRateAvailable(const VideoInfo &cap, long long interval)
+static bool FrameRateAvailable(const VideoInfo& cap, long long interval)
 {
 	return interval == FPS_HIGHEST || interval == FPS_MATCHING ||
-	       between(cap.minInterval - DEVICE_INTERVAL_DIFF_LIMIT, interval,
-		       cap.maxInterval + DEVICE_INTERVAL_DIFF_LIMIT);
+		between(cap.minInterval - DEVICE_INTERVAL_DIFF_LIMIT, interval,
+			cap.maxInterval + DEVICE_INTERVAL_DIFF_LIMIT);
 }
 
-static long long FrameRateInterval(const VideoInfo &cap, long long desired_interval)
+static long long FrameRateInterval(const VideoInfo& cap, long long desired_interval)
 {
 	return desired_interval < cap.minInterval ? cap.minInterval : min(desired_interval, cap.maxInterval);
 }
@@ -490,11 +437,11 @@ static inline enum speaker_layout convert_speaker_layout(uint8_t channels)
 //#define LOG_ENCODED_VIDEO_TS 1
 //#define LOG_ENCODED_AUDIO_TS 1
 
-void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char *data, size_t size, long long ts)
+void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char* data, size_t size, long long ts)
 {
 	/* If format or hw decode changes, recreate the decoder */
 	if (ffmpeg_decode_valid(video_decoder) &&
-	    ((video_decoder->codec->id != id) || (video_decoder->hw != hw_decode))) {
+		((video_decoder->codec->id != id) || (video_decoder->hw != hw_decode))) {
 		ffmpeg_decode_free(video_decoder);
 	}
 
@@ -519,19 +466,41 @@ void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char *data, size
 #if LOG_ENCODED_VIDEO_TS
 		blog(LOG_DEBUG, "video ts: %llu", frame.timestamp);
 #endif
-		obs_source_output_video2(source, &frame);
+
+		if (!use_limitInterval) {
+			obs_source_output_video2(source, &frame);
+			lastLimitTS = frame.timestamp;
+			return;
+		}
+
+		if (limitInterval <= videoConfig.frameInterval) {
+			obs_source_output_video2(source, &frame);
+			lastLimitTS = frame.timestamp;
+			return;
+		}
+
+		const int adjustLimitInterval = limitInterval * 100;
+		if (lastLimitTS == 0 ||
+			frame.timestamp - lastLimitTS >= adjustLimitInterval)
+		{
+			lastLimitTS = frame.timestamp;
+			obs_source_output_video2(source, &frame);
+		}
 	}
 
 }
 
-void DShowInput::OnReactivate()
-{
-	SetActive(true);
-}
 
-void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, size_t size, long long startTime,
-			     long long endTime, long rotation)
+void DShowInput::OnVideoData(const VideoConfig& config, unsigned char* data, size_t size, long long startTime,
+	long long endTime, long rotation)
 {
+	CriticalScope callbackScope(callbackMutex);
+
+	if (destroying || !active)
+		return;
+
+	videoConfig = config;
+
 	if (autorotation && rotation != lastRotation) {
 		lastRotation = rotation;
 		obs_source_set_async_rotation(source, rotation);
@@ -575,12 +544,14 @@ void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, siz
 		frame.data[0] = data;
 		frame.linesize[0] = cx * 4;
 
-	} else if (videoConfig.format == VideoFormat::YVYU || videoConfig.format == VideoFormat::YUY2 ||
-		   videoConfig.format == VideoFormat::HDYC || videoConfig.format == VideoFormat::UYVY) {
+	}
+	else if (videoConfig.format == VideoFormat::YVYU || videoConfig.format == VideoFormat::YUY2 ||
+		videoConfig.format == VideoFormat::HDYC || videoConfig.format == VideoFormat::UYVY) {
 		frame.data[0] = data;
 		frame.linesize[0] = cx * 2;
 
-	} else if (videoConfig.format == VideoFormat::I420) {
+	}
+	else if (videoConfig.format == VideoFormat::I420) {
 		frame.data[0] = data;
 		frame.data[1] = frame.data[0] + (cx * cy_abs);
 		frame.data[2] = frame.data[1] + (cx * cy_abs / 4);
@@ -588,7 +559,8 @@ void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, siz
 		frame.linesize[1] = cx / 2;
 		frame.linesize[2] = cx / 2;
 
-	} else if (videoConfig.format == VideoFormat::YV12) {
+	}
+	else if (videoConfig.format == VideoFormat::YV12) {
 		frame.data[0] = data;
 		frame.data[2] = frame.data[0] + (cx * cy_abs);
 		frame.data[1] = frame.data[2] + (cx * cy_abs / 4);
@@ -596,23 +568,27 @@ void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, siz
 		frame.linesize[1] = cx / 2;
 		frame.linesize[2] = cx / 2;
 
-	} else if (videoConfig.format == VideoFormat::NV12) {
+	}
+	else if (videoConfig.format == VideoFormat::NV12) {
 		frame.data[0] = data;
 		frame.data[1] = frame.data[0] + (cx * cy_abs);
 		frame.linesize[0] = cx;
 		frame.linesize[1] = cx;
 
-	} else if (videoConfig.format == VideoFormat::Y800) {
+	}
+	else if (videoConfig.format == VideoFormat::Y800) {
 		frame.data[0] = data;
 		frame.linesize[0] = cx;
 
-	} else if (videoConfig.format == VideoFormat::P010) {
+	}
+	else if (videoConfig.format == VideoFormat::P010) {
 		frame.data[0] = data;
 		frame.data[1] = frame.data[0] + (cx * cy_abs) * 2;
 		frame.linesize[0] = cx * 2;
 		frame.linesize[1] = cx * 2;
 
-	} else {
+	}
+	else {
 		/* TODO: other formats */
 		return;
 	}
@@ -640,8 +616,14 @@ void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, siz
 	UNUSED_PARAMETER(endTime); /* it's the enndd tiimmes! */
 }
 
-void DShowInput::OnEncodedAudioData(enum AVCodecID id, unsigned char *data, size_t size, long long ts)
+void DShowInput::OnEncodedAudioData(enum AVCodecID id, unsigned char* data, size_t size, long long ts)
 {
+	/* Audio output route is shared by DShowInstance.  If the shared
+	 * DirectShow graph is configured for DirectSound/WaveOut, audio is
+	 * played by the graph and must not also be sent to the OBS mixer. */
+	if (sharedAudioOutputMode != (int)AudioMode::Capture)
+		return;
+
 	if (!ffmpeg_decode_valid(audio_decoder)) {
 		if (ffmpeg_decode_init(audio_decoder, id, false) < 0) {
 			blog(LOG_WARNING, "%s: Could not initialize audio decoder", obs_source_get_name(source));
@@ -663,29 +645,44 @@ void DShowInput::OnEncodedAudioData(enum AVCodecID id, unsigned char *data, size
 			blog(LOG_DEBUG, "audio ts: %llu", audio.timestamp);
 #endif
 			obs_source_output_audio(source, &audio);
-		} else {
+		}
+		else {
 			break;
 		}
 
 		ts += int64_t(audio_decoder->frame->nb_samples) * 10000000LL /
-		      int64_t(audio_decoder->frame->sample_rate);
+			int64_t(audio_decoder->frame->sample_rate);
 		size = 0;
 		data = nullptr;
 	} while (got_output);
 }
 
-void DShowInput::OnAudioData(const AudioConfig &config, unsigned char *data, size_t size, long long startTime,
-			     long long endTime)
+void DShowInput::OnAudioData(const AudioConfig& config, unsigned char* data, size_t size, long long startTime,
+	long long endTime)
 {
+	CriticalScope callbackScope(callbackMutex);
+
+	if (destroying || !active)
+		return;
+
+	/* The audio output mode belongs to the shared DShowInstance.
+	 * Capture => send audio to OBS mixer.
+	 * DirectSound/WaveOut => the DirectShow graph plays to PC speaker,
+	 * so per-source OBS mixer output must be skipped. */
+	if (sharedAudioOutputMode != (int)AudioMode::Capture)
+		return;
+
 	size_t block_size;
 
 	if (config.format == AudioFormat::AAC) {
 		OnEncodedAudioData(AV_CODEC_ID_AAC, data, size, startTime);
 		return;
-	} else if (config.format == AudioFormat::AC3) {
+	}
+	else if (config.format == AudioFormat::AC3) {
 		OnEncodedAudioData(AV_CODEC_ID_AC3, data, size, startTime);
 		return;
-	} else if (config.format == AudioFormat::MPGA) {
+	}
+	else if (config.format == AudioFormat::MPGA) {
 		OnEncodedAudioData(AV_CODEC_ID_MP2, data, size, startTime);
 		return;
 	}
@@ -707,16 +704,16 @@ void DShowInput::OnAudioData(const AudioConfig &config, unsigned char *data, siz
 }
 
 struct PropertiesData {
-	DShowInput *input;
+	DShowInput* input;
 	vector<VideoDevice> devices;
 	vector<AudioDevice> audioDevices;
 
-	bool GetDevice(VideoDevice &device, const char *encoded_id) const
+	bool GetDevice(VideoDevice& device, const char* encoded_id) const
 	{
 		DeviceId deviceId;
 		DecodeDeviceId(deviceId, encoded_id);
 
-		for (const VideoDevice &curDevice : devices) {
+		for (const VideoDevice& curDevice : devices) {
 			if (deviceId.name == curDevice.name && deviceId.path == curDevice.path) {
 				device = curDevice;
 				return true;
@@ -727,7 +724,7 @@ struct PropertiesData {
 	}
 };
 
-static inline bool ConvertRes(int &cx, int &cy, const char *res)
+static inline bool ConvertRes(int& cx, int& cy, const char* res)
 {
 	return sscanf(res, "%dx%d", &cx, &cy) == 2;
 }
@@ -737,7 +734,7 @@ static inline bool FormatMatches(VideoFormat left, VideoFormat right)
 	return left == VideoFormat::Any || right == VideoFormat::Any || left == right;
 }
 
-static inline bool ResolutionValid(const string &res, int &cx, int &cy)
+static inline bool ResolutionValid(const string& res, int& cx, int& cy)
 {
 	if (!res.size())
 		return false;
@@ -745,36 +742,36 @@ static inline bool ResolutionValid(const string &res, int &cx, int &cy)
 	return ConvertRes(cx, cy, res.c_str());
 }
 
-static inline bool CapsMatch(const VideoInfo &)
+static inline bool CapsMatch(const VideoInfo&)
 {
 	return true;
 }
 
-template<typename... F> static bool CapsMatch(const VideoDevice &dev, F... fs);
+template<typename... F> static bool CapsMatch(const VideoDevice& dev, F... fs);
 
-template<typename F, typename... Fs> static inline bool CapsMatch(const VideoInfo &info, F &&f, Fs... fs)
+template<typename F, typename... Fs> static inline bool CapsMatch(const VideoInfo& info, F&& f, Fs... fs)
 {
 	return f(info) && CapsMatch(info, fs...);
 }
 
-template<typename... F> static bool CapsMatch(const VideoDevice &dev, F... fs)
+template<typename... F> static bool CapsMatch(const VideoDevice& dev, F... fs)
 {
 	// no early exit, trigger all side effects.
 	bool match = false;
-	for (const VideoInfo &info : dev.caps)
+	for (const VideoInfo& info : dev.caps)
 		if (CapsMatch(info, fs...))
 			match = true;
 	return match;
 }
 
-static inline bool MatcherMatchVideoFormat(VideoFormat format, bool &did_match, const VideoInfo &info)
+static inline bool MatcherMatchVideoFormat(VideoFormat format, bool& did_match, const VideoInfo& info)
 {
 	bool match = FormatMatches(format, info.format);
 	did_match = did_match || match;
 	return match;
 }
 
-static inline bool MatcherClosestFrameRateSelector(long long interval, long long &best_match, const VideoInfo &info)
+static inline bool MatcherClosestFrameRateSelector(long long interval, long long& best_match, const VideoInfo& info)
 {
 	long long current = FrameRateInterval(info, interval);
 	if (llabs(interval - best_match) > llabs(interval - current))
@@ -784,36 +781,36 @@ static inline bool MatcherClosestFrameRateSelector(long long interval, long long
 
 #if 0
 auto ResolutionMatcher = [](int cx, int cy)
-{
-	return [cx, cy](const VideoInfo &info)
 	{
-		return ResolutionAvailable(info, cx, cy);
+		return [cx, cy](const VideoInfo& info)
+			{
+				return ResolutionAvailable(info, cx, cy);
+			};
 	};
-};
 
 auto FrameRateMatcher = [](long long interval)
-{
-	return [interval](const VideoInfo &info)
 	{
-		return FrameRateAvailable(info, interval);
+		return [interval](const VideoInfo& info)
+			{
+				return FrameRateAvailable(info, interval);
+			};
 	};
-};
 
-auto VideoFormatMatcher = [](VideoFormat format, bool &did_match)
-{
-	return [format, &did_match](const VideoInfo &info)
+auto VideoFormatMatcher = [](VideoFormat format, bool& did_match)
 	{
-		return MatcherMatchVideoFormat(format, did_match, info);
+		return [format, &did_match](const VideoInfo& info)
+			{
+				return MatcherMatchVideoFormat(format, did_match, info);
+			};
 	};
-};
 
-auto ClosestFrameRateSelector = [](long long interval, long long &best_match)
-{
-	return [interval, &best_match](const VideoInfo &info) mutable -> bool
+auto ClosestFrameRateSelector = [](long long interval, long long& best_match)
 	{
-		MatcherClosestFrameRateSelector(interval, best_match, info);
-	};
-}
+		return [interval, &best_match](const VideoInfo& info) mutable -> bool
+			{
+				MatcherClosestFrameRateSelector(interval, best_match, info);
+			};
+	}
 #else
 #define ResolutionMatcher(cx, cy)                         \
 	[cx, cy](const VideoInfo &info) -> bool {         \
@@ -833,16 +830,16 @@ auto ClosestFrameRateSelector = [](long long interval, long long &best_match)
 	}
 #endif
 
-static bool ResolutionAvailable(const VideoDevice &dev, int cx, int cy)
+static bool ResolutionAvailable(const VideoDevice & dev, int cx, int cy)
 {
 	return CapsMatch(dev, ResolutionMatcher(cx, cy));
 }
 
-static bool DetermineResolution(int &cx, int &cy, obs_data_t *settings, VideoDevice &dev)
+static bool DetermineResolution(int& cx, int& cy, obs_data_t* settings, VideoDevice& dev)
 {
-	const char *res = obs_data_get_autoselect_string(settings, RESOLUTION);
+	const char* res = obs_data_get_autoselect_string(settings, RESOLUTION);
 	if (obs_data_has_autoselect_value(settings, RESOLUTION) && ConvertRes(cx, cy, res) &&
-	    ResolutionAvailable(dev, cx, cy))
+		ResolutionAvailable(dev, cx, cy))
 		return true;
 
 	res = obs_data_get_string(settings, RESOLUTION);
@@ -858,19 +855,19 @@ static bool DetermineResolution(int &cx, int &cy, obs_data_t *settings, VideoDev
 
 static long long GetOBSFPS();
 
-static inline bool IsDelayedDevice(const VideoConfig &config)
+static inline bool IsDelayedDevice(const VideoConfig& config)
 {
 	return config.format > VideoFormat::MJPEG ||
-	       wstrstri(config.name.c_str(), L"elgato game capture hd") != nullptr ||
-	       wstrstri(config.name.c_str(), L"stream engine") != nullptr;
+		wstrstri(config.name.c_str(), L"elgato game capture hd") != nullptr ||
+		wstrstri(config.name.c_str(), L"stream engine") != nullptr;
 }
 
-static inline bool IsDecoupled(const VideoConfig &config)
+static inline bool IsDecoupled(const VideoConfig& config)
 {
 	return wstrstri(config.name.c_str(), L"GV-USB2") != NULL;
 }
 
-inline void DShowInput::SetupBuffering(obs_data_t *settings)
+inline void DShowInput::SetupBuffering(obs_data_t* settings)
 {
 	BufferingType bufType;
 	bool useBuffering;
@@ -888,209 +885,943 @@ inline void DShowInput::SetupBuffering(obs_data_t *settings)
 
 static DStr GetVideoFormatName(VideoFormat format);
 
-bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
+
+/* DSHOW Instance - BEGIN */
+static inline std::string GetDShowVideoId(obs_data_t* settings)
 {
-	string video_device_id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
-	deactivateWhenNotShowing = obs_data_get_bool(settings, DEACTIVATE_WNS);
-	flip = obs_data_get_bool(settings, FLIP_IMAGE);
-	autorotation = obs_data_get_bool(settings, AUTOROTATION);
-	hw_decode = obs_data_get_bool(settings, HW_DECODE);
-	limitInterval = (int)obs_data_get_int(settings, LIMIT_FRAME);
-	use_limitInterval = obs_data_get_bool(settings, USE_LIMIT_FRAME);
-
-	DeviceId id;
-	if (!DecodeDeviceId(id, video_device_id.c_str())) {
-		blog(LOG_WARNING, "%s: DecodeDeviceId failed", obs_source_get_name(source));
-		return false;
-	}
-
-	PropertiesData data;
-	Device::EnumVideoDevices(data.devices);
-	VideoDevice dev;
-	if (!data.GetDevice(dev, video_device_id.c_str())) {
-		blog(LOG_WARNING, "%s: data.GetDevice failed", obs_source_get_name(source));
-		return false;
-	}
-
-	int resType = (int)obs_data_get_int(settings, RES_TYPE);
-	int cx = 0, cy = 0;
-	long long interval = 0;
-	VideoFormat format = VideoFormat::Any;
-
-	if (resType == ResType_Custom) {
-		bool has_autosel_val;
-		string resolution = obs_data_get_string(settings, RESOLUTION);
-		if (!ResolutionValid(resolution, cx, cy)) {
-			blog(LOG_WARNING, "%s: ResolutionValid failed", obs_source_get_name(source));
-			return false;
-		}
-
-		has_autosel_val = obs_data_has_autoselect_value(settings, FRAME_INTERVAL);
-		interval = has_autosel_val ? obs_data_get_autoselect_int(settings, FRAME_INTERVAL)
-					   : obs_data_get_int(settings, FRAME_INTERVAL);
-
-		if (interval == FPS_MATCHING)
-			interval = GetOBSFPS();
-
-		format = (VideoFormat)obs_data_get_int(settings, VIDEO_FORMAT);
-
-		long long best_interval = numeric_limits<long long>::max();
-		bool video_format_match = false;
-		bool caps_match =
-			CapsMatch(dev, ResolutionMatcher(cx, cy), VideoFormatMatcher(format, video_format_match),
-				  ClosestFrameRateSelector(interval, best_interval), FrameRateMatcher(interval));
-
-		if (!caps_match && !video_format_match) {
-			blog(LOG_WARNING, "%s: Video format match failed", obs_source_get_name(source));
-			return false;
-		}
-
-		interval = best_interval;
-	}
-
-	videoConfig.name = id.name;
-	videoConfig.path = id.path;
-	videoConfig.useDefaultConfig = resType == ResType_Preferred;
-	videoConfig.cx = cx;
-	videoConfig.cy_abs = abs(cy);
-	videoConfig.cy_flip = cy < 0;
-	videoConfig.frameInterval = interval;
-	videoConfig.internalFormat = format;
-
-	deviceHasAudio = dev.audioAttached;
-	deviceHasSeparateAudioFilter = dev.separateAudioFilter;
-
-	videoConfig.callback = std::bind(&DShowInput::OnVideoData, this, placeholders::_1, placeholders::_2,
-					 placeholders::_3, placeholders::_4, placeholders::_5, placeholders::_6);
-	videoConfig.reactivateCallback = std::bind(&DShowInput::OnReactivate, this);
-
-	videoConfig.format = videoConfig.internalFormat;
-
-	if (!device.SetVideoConfig(&videoConfig)) {
-		blog(LOG_WARNING, "%s: device.SetVideoConfig failed", obs_source_get_name(source));
-		return false;
-	}
-
-	if (!videoConfig.cx || !videoConfig.cy_abs) {
-		blog(LOG_ERROR, "%s: Frame width or height are zero (%" PRIu32 "x%" PRIu32 ")",
-		     obs_source_get_name(source), videoConfig.cx, videoConfig.cy_abs);
-		return false;
-	}
-
-	DStr formatName = GetVideoFormatName(videoConfig.internalFormat);
-
-	double fps = 0.0;
-
-	if (videoConfig.frameInterval)
-		fps = 10000000.0 / double(videoConfig.frameInterval);
-
-	BPtr<char> name_utf8;
-	BPtr<char> path_utf8;
-	os_wcs_to_utf8_ptr(videoConfig.name.c_str(), videoConfig.name.size(), &name_utf8);
-	os_wcs_to_utf8_ptr(videoConfig.path.c_str(), videoConfig.path.size(), &path_utf8);
-
-	SetupBuffering(settings);
-
-	blog(LOG_INFO, "---------------------------------");
-	blog(LOG_INFO,
-	     "[DShow Device: '%s'] settings updated: \n"
-	     "\tvideo device: %s\n"
-	     "\tvideo path: %s\n"
-	     "\tresolution: %dx%d\n"
-	     "\tflip: %d\n"
-	     "\tfps: %0.2f (interval: %lld)\n"
-	     "\tformat: %s\n"
-	     "\tbuffering: %s\n"
-	     "\thardware decode: %s",
-	     obs_source_get_name(source), (const char *)name_utf8, (const char *)path_utf8, videoConfig.cx,
-	     videoConfig.cy_abs, (int)videoConfig.cy_flip, fps, videoConfig.frameInterval, formatName->array,
-	     obs_source_async_unbuffered(source) ? "disabled" : "enabled", hw_decode ? "enabled" : "disabled");
-
-	return true;
+	const char* id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
+	return id ? id : "";
 }
 
-bool DShowInput::UpdateAudioConfig(obs_data_t *settings)
+static inline DShowInstanceSettings CopySharedDeviceSettings(obs_data_t* settings)
 {
-	string audio_device_id = obs_data_get_string(settings, AUDIO_DEVICE_ID);
-	bool useCustomAudio = obs_data_get_bool(settings, USE_CUSTOM_AUDIO);
+	DShowInstanceSettings s;
 
-	if (useCustomAudio) {
-		DeviceId id;
-		if (!DecodeDeviceId(id, audio_device_id.c_str())) {
-			obs_source_set_audio_active(source, false);
-			return false;
+	s.videoDeviceId = obs_data_get_string(settings, VIDEO_DEVICE_ID);
+	s.resType = (int)obs_data_get_int(settings, RES_TYPE);
+	s.resolution = obs_data_get_string(settings, RESOLUTION);
+
+	bool has_autosel_val = obs_data_has_autoselect_value(settings, FRAME_INTERVAL);
+	s.frameInterval = has_autosel_val ? obs_data_get_autoselect_int(settings, FRAME_INTERVAL)
+		: obs_data_get_int(settings, FRAME_INTERVAL);
+
+	s.videoFormat = (VideoFormat)obs_data_get_int(settings, VIDEO_FORMAT);
+	s.buffering = (int)obs_data_get_int(settings, BUFFERING_VAL);
+	s.colorSpace = obs_data_get_string(settings, COLOR_SPACE);
+	s.colorRange = obs_data_get_string(settings, COLOR_RANGE);
+
+	s.audioOutputMode = (int)obs_data_get_int(settings, AUDIO_OUTPUT_MODE);
+	s.useCustomAudio = obs_data_get_bool(settings, USE_CUSTOM_AUDIO);
+	s.audioDeviceId = obs_data_get_string(settings, AUDIO_DEVICE_ID);
+
+	return s;
+}
+
+static inline void SyncPropertySettings(obs_data_t* settings, const DShowInstanceSettings& s)
+{
+	obs_data_set_string(settings, VIDEO_DEVICE_ID, s.videoDeviceId.c_str());
+	obs_data_set_int(settings, RES_TYPE, s.resType);
+	obs_data_set_string(settings, RESOLUTION, s.resolution.c_str());
+	obs_data_set_int(settings, FRAME_INTERVAL, s.frameInterval);
+	obs_data_set_int(settings, VIDEO_FORMAT, (int)s.videoFormat);
+
+	obs_data_set_int(settings, BUFFERING_VAL, s.buffering);
+
+	obs_data_set_string(settings, COLOR_SPACE, s.colorSpace.c_str());
+	obs_data_set_string(settings, COLOR_RANGE, s.colorRange.c_str());
+
+	obs_data_set_int(settings, AUDIO_OUTPUT_MODE, s.audioOutputMode);
+	obs_data_set_bool(settings, USE_CUSTOM_AUDIO, s.useCustomAudio);
+	obs_data_set_string(settings, AUDIO_DEVICE_ID, s.audioDeviceId.c_str());
+}
+
+static inline bool DShowGraphConfigEquals(const DShowInstanceSettings& a, const DShowInstanceSettings& b)
+{
+	return a.videoDeviceId == b.videoDeviceId &&
+		a.resType == b.resType &&
+		a.resolution == b.resolution &&
+		a.frameInterval == b.frameInterval &&
+		a.videoFormat == b.videoFormat &&
+		a.audioOutputMode == b.audioOutputMode &&
+		a.useCustomAudio == b.useCustomAudio &&
+		a.audioDeviceId == b.audioDeviceId;
+}
+
+struct DShowInstanceAction {
+	Action action = Action::None;
+
+	// Use Activate/Reconfigure 
+	DShowInstanceSettings snapshot;
+	bool hasSnapshot = false;
+};
+
+class DShowInstance {
+	Device device;
+	VideoConfig videoConfig;
+	AudioConfig audioConfig;
+
+	bool deviceHasAudio = false;
+	bool deviceHasSeparateAudioFilter = false;
+
+	DShowInstanceSettings snapshot;
+
+	WinHandle semaphore;
+	WinHandle activated_event;
+	WinHandle thread;
+
+	CriticalSection mutex;
+	vector<DShowInstanceAction> actions;
+	vector<DShowInput*> subscribers;
+	bool sharedDeviceActive = true;
+	bool graphRunning = false;
+	bool obsAudioAvailable = false;	// Checking custom Audio, Has Audio 
+	uint64_t sharedSettingsVersion = 0;
+
+	bool activateResult = false;
+
+public:
+	explicit DShowInstance(const std::string& videoId) : device(InitGraph::False)
+	{
+		snapshot.videoDeviceId = videoId;
+
+		semaphore = CreateSemaphore(nullptr, 0, 0x7FFFFFFF, nullptr);
+		if (!semaphore)
+			throw "Failed to create DShowInstance semaphore";
+
+		activated_event = CreateEvent(nullptr, false, false, nullptr);
+		if (!activated_event)
+			throw "Failed to create DShowInstance activated_event";
+
+		thread = CreateThread(nullptr, 0, DShowInstanceThread, this, 0, nullptr);
+		if (!thread)
+			throw "Failed to create DShowInstance thread";
+	}
+
+	~DShowInstance()
+	{
+		{
+			CriticalScope scope(mutex);
+
+			actions.resize(1);
+			actions[0] = DShowInstanceAction();
+			actions[0].action = Action::Shutdown;
 		}
 
-		audioConfig.name = id.name;
-		audioConfig.path = id.path;
+		ReleaseSemaphore(semaphore, 1, nullptr);
 
-	} else if (!deviceHasAudio) {
-		obs_source_set_audio_active(source, false);
+		if (thread)
+			WaitForSingleObject(thread, INFINITE);
+	}
+
+	const std::string& Key() const { return snapshot.videoDeviceId; }
+
+	DShowInstanceSettings GetSettingsSnapshot()
+	{
+		CriticalScope scope(mutex);
+		return snapshot;
+	}
+
+	VideoConfig GetVideoConfigSnapshot()
+	{
+		CriticalScope scope(mutex);
+		return videoConfig;
+	}
+
+	bool IsGraphRunning()
+	{
+		CriticalScope scope(mutex);
+		return graphRunning;
+	}
+
+	bool IsSharedDeviceActive()
+	{
+		CriticalScope scope(mutex);
+		return sharedDeviceActive;
+	}
+
+	void AddSubscriber(DShowInput* input)
+	{
+		CriticalScope scope(mutex);
+
+		if (std::find(subscribers.begin(), subscribers.end(), input) == subscribers.end())
+			subscribers.push_back(input);
+
+		/* Keep the mixer entry state in sync as soon as a source joins. */
+		if (graphRunning)
+			SyncAudioActiveStateLocked();
+
+		/* If a source joins an already running instance, apply the current
+		 * shared settings immediately instead of waiting for another shared
+		 * device update. */
+		if (graphRunning && input && input->source) {
+			obs_data_t* inputSettings = obs_source_get_settings(input->source);
+			if (inputSettings) {
+				SyncPropertySettings(inputSettings, snapshot);
+				obs_data_set_bool(inputSettings, "active", input->active);
+				input->SyncSourceConfig(inputSettings, videoConfig);
+				input->appliedSharedSettingsVersion = sharedSettingsVersion;
+				obs_data_release(inputSettings);
+			}
+		}
+	}
+
+	void RemoveSubscriber(DShowInput* input)
+	{
+		CriticalScope scope(mutex);
+
+		subscribers.erase(std::remove(subscribers.begin(), subscribers.end(), input), subscribers.end());
+	}
+
+
+	/* Activate/Deactivate is shared per DirectShow device instance. */
+	void SetSharedDeviceActive(bool active, obs_data_t* settings)
+	{
+		{
+			CriticalScope scope(mutex);
+			sharedDeviceActive = active;
+
+			for (DShowInput* input : subscribers) {
+				if (!input || !input->source)
+					continue;
+
+				input->active = active;
+
+				obs_data_t* inputSettings = obs_source_get_settings(input->source);
+				if (inputSettings) {
+					obs_data_set_bool(inputSettings, "active", active);
+					obs_data_release(inputSettings);
+				}
+			}
+
+			SyncAudioActiveStateLocked();
+		}
+
+		if (!active) {
+			QueueAction(Action::Deactivate, nullptr, false);
+			OutputNullToSubscribers();
+			return;
+		}
+
+		if (ShouldKeepDeviceRunning()) {
+			if (settings) {
+				ReconfigureAsync(settings);
+			}
+			else {
+				obs_data_t* snapshotSettings = obs_data_create();
+				{
+					CriticalScope scope(mutex);
+					SyncPropertySettings(snapshotSettings, snapshot);
+				}
+
+				ReconfigureAsync(snapshotSettings);
+				obs_data_release(snapshotSettings);
+			}
+		}
+	}
+
+	void NotifyShow(DShowInput* input)
+	{
+		if (!input || !input->active)
+			return;
+
+		if (!ShouldKeepDeviceRunning()) {
+			OutputNullToHiddenSubscribers();
+			{
+				CriticalScope scope(mutex);
+				SyncAudioActiveStateLocked();
+			}
+			return;
+		}
+
+		if (!IsGraphRunning()) {
+			obs_data_t* settings = nullptr;
+			if (input->source)
+				settings = obs_source_get_settings(input->source);
+
+			if (settings) {
+				ReconfigureAsync(settings);
+				obs_data_release(settings);
+			}
+			return;
+		}
+
+		OutputNullToHiddenSubscribers();
+		{
+			CriticalScope scope(mutex);
+			SyncAudioActiveStateLocked();
+		}
+	}
+
+	void NotifyHide(DShowInput* input)
+	{
+		UNUSED_PARAMETER(input);
+
+		OutputNullToHiddenSubscribers();
+
+		{
+			CriticalScope scope(mutex);
+			SyncAudioActiveStateLocked();
+		}
+
+		if (!ShouldKeepDeviceRunning())
+			QueueAction(Action::Deactivate, nullptr, false);
+	}
+
+	size_t SubscriberCount()
+	{
+		CriticalScope scope(mutex);
+		return subscribers.size();
+	}
+
+	bool Start(obs_data_t* settings)
+	{
+		return QueueAction(Action::ActivateBlock, settings, true);
+	}
+
+	bool Reconfigure(obs_data_t* settings)
+	{
+		return QueueAction(Action::ActivateBlock, settings, true);
+	}
+
+	void QueueConfigVideo()
+	{
+		QueueAction(Action::ConfigVideo, nullptr, false);
+	}
+
+	void QueueConfigAudio()
+	{
+		QueueAction(Action::ConfigAudio, nullptr, false);
+	}
+
+	void QueueConfigCrossbar1()
+	{
+		QueueAction(Action::ConfigCrossbar1, nullptr, false);
+	}
+
+	void QueueConfigCrossbar2()
+	{
+		QueueAction(Action::ConfigCrossbar2, nullptr, false);
+	}
+
+	static inline obs_data_t* CreateSettingsFromSnapshot(const DShowInstanceSettings& s)
+	{
+		obs_data_t* settings = obs_data_create();
+		SyncPropertySettings(settings, s);
+		return settings;
+	}
+
+	void DShowLoop()
+	{
+		while (true) {
+			DWORD ret = MsgWaitForMultipleObjects(1, &semaphore, false, INFINITE, QS_ALLINPUT);
+			if (ret == (WAIT_OBJECT_0 + 1)) {
+				ProcessMessages();
+				continue;
+			}
+			else if (ret != WAIT_OBJECT_0) {
+				break;
+			}
+
+			DShowInstanceAction item;
+			{
+				CriticalScope scope(mutex);
+				if (actions.size()) {
+					item = actions.front();
+					actions.erase(actions.begin());
+				}
+			}
+
+			switch (item.action) {
+			case Action::Activate:
+			case Action::ActivateBlock:
+				activateResult = false;
+
+				if (item.hasSnapshot) {
+					obs_data_t* settings = CreateSettingsFromSnapshot(item.snapshot);
+					if (settings) {
+						activateResult = ActivateInternal(settings);
+						obs_data_release(settings);
+					}
+				}
+
+				if (item.action == Action::ActivateBlock)
+					SetEvent(activated_event);
+				break;
+
+			case Action::Deactivate:
+				if (ShouldKeepDeviceRunning())
+					break;
+
+				device.ResetGraph();
+				SetGraphStoppedState();
+				break;
+
+			case Action::Shutdown:
+				device.ShutdownGraph();
+				return;
+
+			case Action::ConfigVideo:
+				device.OpenDialog(nullptr, DialogType::ConfigVideo);
+				break;
+
+			case Action::ConfigAudio:
+				device.OpenDialog(nullptr, DialogType::ConfigAudio);
+				break;
+
+			case Action::ConfigCrossbar1:
+				device.OpenDialog(nullptr, DialogType::ConfigCrossbar);
+				break;
+
+			case Action::ConfigCrossbar2:
+				device.OpenDialog(nullptr, DialogType::ConfigCrossbar2);
+				break;
+
+			case Action::None:
+				break;
+			}
+		}
+	}
+
+	void OnReactivate()
+	{
+		obs_data_t* settings = obs_data_create();
+		{
+			CriticalScope scope(mutex);
+			SyncPropertySettings(settings, snapshot);
+		}
+
+		QueueAction(Action::Activate, settings, false);
+		obs_data_release(settings);
+	}
+
+	void OnVideoData(const VideoConfig& config, unsigned char* data, size_t size, long long startTime,
+		long long endTime, long rotation)
+	{
+		/* Dispatch under lock to avoid subscriber lifetime races. */
+		CriticalScope scope(mutex);
+
+		for (DShowInput* input : subscribers) {
+			if (!IsSourceOutputAllowedLocked(input))
+				continue;
+
+			if (input->appliedSharedSettingsVersion != sharedSettingsVersion) {
+				input->SyncSourceConfig(snapshot, videoConfig);
+				input->appliedSharedSettingsVersion = sharedSettingsVersion;
+			}
+
+			input->OnVideoData(config, data, size, startTime, endTime, rotation);
+		}
+	}
+
+	void OnAudioData(const AudioConfig& config, unsigned char* data, size_t size, long long startTime,
+		long long endTime)
+	{
+		CriticalScope scope(mutex);
+
+		if (snapshot.audioOutputMode != (int)AudioMode::Capture)
+			return;
+
+		for (DShowInput* input : subscribers) {
+			if (IsSourceOutputAllowedLocked(input))
+				input->OnAudioData(config, data, size, startTime, endTime);
+		}
+	}
+
+	bool ReconfigureAsync(obs_data_t* settings)
+	{
+		return QueueAction(Action::Activate, settings, false);
+	}
+
+private:
+	bool QueueAction(Action action, obs_data_t* settings, bool block)
+	{
+		DShowInstanceAction item;
+		item.action = action;
+
+		if (settings) {
+			/* Snapshot settings now; obs_data_t may change before the worker runs. */
+			item.snapshot = CopySharedDeviceSettings(settings);
+			item.hasSnapshot = true;
+		}
+
+		{
+			CriticalScope scope(mutex);
+			actions.push_back(item);
+		}
+
+		ReleaseSemaphore(semaphore, 1, nullptr);
+
+		if (block) {
+			WaitForSingleObject(activated_event, INFINITE);
+			return activateResult;
+		}
+
 		return true;
 	}
 
-	audioConfig.useVideoDevice = !useCustomAudio && !deviceHasSeparateAudioFilter;
-	audioConfig.useSeparateAudioFilter = deviceHasSeparateAudioFilter;
+	void SyncAudioActiveStateLocked()
+	{
+		for (DShowInput* input : subscribers) {
+			if (!input || input->destroying || !input->source)
+				continue;
 
-	audioConfig.callback = std::bind(&DShowInput::OnAudioData, this, placeholders::_1, placeholders::_2,
-					 placeholders::_3, placeholders::_4, placeholders::_5);
+			bool audioActive = graphRunning && obsAudioAvailable &&
+				IsSourceOutputAllowedLocked(input);
 
-	audioConfig.mode = (AudioMode)obs_data_get_int(settings, AUDIO_OUTPUT_MODE);
+			if (obs_source_audio_active(input->source) != audioActive)
+				obs_source_set_audio_active(input->source, audioActive);
+		}
+	}
 
-	bool success = device.SetAudioConfig(&audioConfig);
-	if (!success) {
-		obs_source_set_audio_active(source, false);
+	void SetGraphStoppedState(bool syncAudioState = true)
+	{
+		CriticalScope scope(mutex);
+
+		graphRunning = false;
+		obsAudioAvailable = false;
+
+		if(syncAudioState)
+			SyncAudioActiveStateLocked();
+	}
+
+	bool IsSourceOutputAllowedLocked(DShowInput* input)
+	{
+		if (!input || input->destroying || !input->source)
+			return false;
+
+		if (!input->active)
+			return false;
+
+		if (!input->deactivateWhenNotShowing)
+			return true;
+
+		return input->showing;
+	}
+
+	void OutputNullToHiddenSubscribers()
+	{
+		CriticalScope scope(mutex);
+
+		for (DShowInput* input : subscribers) {
+			if (!input || !input->source)
+				continue;
+
+			if (!input->active)
+				continue;
+
+			if (!input->deactivateWhenNotShowing)
+				continue;
+
+			if (input->showing)
+				continue;
+
+			obs_source_output_video2(input->source, nullptr);
+		}
+	}
+
+	bool ShouldKeepDeviceRunning()
+	{
+		CriticalScope scope(mutex);
+
+		if (!sharedDeviceActive)
+			return false;
+
+		for (DShowInput* input : subscribers) {
+			if (IsSourceOutputAllowedLocked(input))
+				return true;
+		}
+
 		return false;
 	}
 
-	obs_source_set_audio_active(source, true);
+	void OutputNullToSubscribers()
+	{
+		CriticalScope scope(mutex);
 
-	BPtr<char> name_utf8;
-	os_wcs_to_utf8_ptr(audioConfig.name.c_str(), audioConfig.name.size(), &name_utf8);
+		for (DShowInput* input : subscribers) {
+			if (!input || !input->source)
+				continue;
 
-	blog(LOG_INFO, "\tusing video device audio: %s", audioConfig.useVideoDevice ? "yes" : "no");
-
-	if (!audioConfig.useVideoDevice) {
-		if (audioConfig.useSeparateAudioFilter)
-			blog(LOG_INFO, "\tseparate audio filter");
-		else
-			blog(LOG_INFO, "\taudio device: %s", (const char *)name_utf8);
+			obs_source_output_video2(input->source, nullptr);
+		}
 	}
 
-	const char *mode = "";
 
-	switch (audioConfig.mode) {
-	case AudioMode::Capture:
-		mode = "Capture";
-		break;
-	case AudioMode::DirectSound:
-		mode = "DirectSound";
-		break;
-	case AudioMode::WaveOut:
-		mode = "WaveOut";
-		break;
+	/* After Apply/OK succeeds, copy shared graph settings to all subscribers. */
+	void ApplySharedSettingsToSubscribers(obs_data_t* settings)
+	{
+		CriticalScope scope(mutex);
+
+		SyncAudioActiveStateLocked();
+
+		for (DShowInput* input : subscribers) {
+			if (!input || input->destroying || !input->source)
+				continue;
+
+			obs_data_t* inputSettings = obs_source_get_settings(input->source);
+			if (!inputSettings)
+				continue;
+
+			SyncPropertySettings(inputSettings, snapshot);
+			obs_data_set_bool(inputSettings, "active", input->active);
+
+			input->SyncSourceConfig(inputSettings, videoConfig);
+			input->appliedSharedSettingsVersion = sharedSettingsVersion;
+			obs_data_release(inputSettings);
+		}
+
+		UNUSED_PARAMETER(settings);
 	}
 
-	blog(LOG_INFO,
-	     "\tsample rate: %d\n"
-	     "\tchannels: %d\n"
-	     "\taudio type: %s",
-	     audioConfig.sampleRate, audioConfig.channels, mode);
-	return true;
+	bool ActivateInternal(obs_data_t* settings)
+	{
+		if (!settings)
+			return false;
+
+		DShowInstanceSettings requestedSnapshot =
+			CopySharedDeviceSettings(settings);
+
+		bool canUpdateWithoutRestart = false;
+		{
+			CriticalScope scope(mutex);
+			canUpdateWithoutRestart = graphRunning && DShowGraphConfigEquals(snapshot, requestedSnapshot);
+
+			if (canUpdateWithoutRestart) {
+				/* The capture device connection can be kept as-is.
+				 * Update the shared settings and make subscribers apply the latest
+				 * source state on the next frame. */
+				snapshot = requestedSnapshot;
+				sharedSettingsVersion++;
+			}
+		}
+
+		if (canUpdateWithoutRestart) {
+			ApplySharedSettingsToSubscribers(settings);
+			return true;
+		}
+
+		if (!device.ResetGraph()) {
+			SetGraphStoppedState();
+			return false;
+		}
+
+		SetGraphStoppedState(false);
+
+		if (!UpdateVideoConfig(settings)) {
+			blog(LOG_WARNING, "DShowInstance: Video configuration failed");
+			SetGraphStoppedState();
+			return false;
+		}
+
+		if (!UpdateAudioConfig(settings))
+			blog(LOG_WARNING, "DShowInstance: Audio configuration failed, ignoring audio");
+
+		if (!device.ConnectFilters()) {
+			SetGraphStoppedState();
+			return false;
+		}
+
+		Result result = device.Start();
+		bool used = (Result::InUse == result);
+		bool visibled = obs_data_get_bool(settings, USED_DEVICE);
+		if (used != visibled)
+			obs_data_set_bool(settings, USED_DEVICE, used);
+
+		if (result != Result::Success) {
+			SetGraphStoppedState();
+			return false;
+		}
+
+		{
+			CriticalScope scope(mutex);
+			snapshot = requestedSnapshot;
+			graphRunning = true;
+			sharedSettingsVersion++;
+		}
+
+		ApplySharedSettingsToSubscribers(settings);
+		return true;
+	}
+
+	bool UpdateVideoConfig(obs_data_t* settings)
+	{
+		string video_device_id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
+
+		DeviceId id;
+		if (!DecodeDeviceId(id, video_device_id.c_str())) {
+			blog(LOG_WARNING, "DShowInstance: DecodeDeviceId failed");
+			return false;
+		}
+
+		PropertiesData data;
+		Device::EnumVideoDevices(data.devices);
+		VideoDevice dev;
+		if (!data.GetDevice(dev, video_device_id.c_str())) {
+			blog(LOG_WARNING, "DShowInstance: data.GetDevice failed");
+			return false;
+		}
+
+		int resType = (int)obs_data_get_int(settings, RES_TYPE);
+		int cx = 0, cy = 0;
+		long long interval = 0;
+		VideoFormat format = VideoFormat::Any;
+
+		if (resType == ResType_Custom) {
+			bool has_autosel_val;
+			string resolution = obs_data_get_string(settings, RESOLUTION);
+			if (!ResolutionValid(resolution, cx, cy)) {
+				blog(LOG_WARNING, "DShowInstance: ResolutionValid failed");
+				return false;
+			}
+
+			has_autosel_val = obs_data_has_autoselect_value(settings, FRAME_INTERVAL);
+			interval = has_autosel_val ? obs_data_get_autoselect_int(settings, FRAME_INTERVAL)
+				: obs_data_get_int(settings, FRAME_INTERVAL);
+
+			if (interval == FPS_MATCHING)
+				interval = GetOBSFPS();
+
+			format = (VideoFormat)obs_data_get_int(settings, VIDEO_FORMAT);
+
+			long long best_interval = numeric_limits<long long>::max();
+			bool video_format_match = false;
+			bool caps_match = CapsMatch(dev, ResolutionMatcher(cx, cy),
+				VideoFormatMatcher(format, video_format_match),
+				ClosestFrameRateSelector(interval, best_interval),
+				FrameRateMatcher(interval));
+
+			if (!caps_match && !video_format_match) {
+				blog(LOG_WARNING, "DShowInstance: Video format match failed");
+				return false;
+			}
+
+			interval = best_interval;
+		}
+
+		videoConfig.name = id.name;
+		videoConfig.path = id.path;
+		videoConfig.useDefaultConfig = resType == ResType_Preferred;
+		videoConfig.cx = cx;
+		videoConfig.cy_abs = abs(cy);
+		videoConfig.cy_flip = cy < 0;
+		videoConfig.frameInterval = interval;
+		videoConfig.internalFormat = format;
+
+		deviceHasAudio = dev.audioAttached;
+		deviceHasSeparateAudioFilter = dev.separateAudioFilter;
+
+		videoConfig.callback = std::bind(&DShowInstance::OnVideoData, this, placeholders::_1, placeholders::_2,
+			placeholders::_3, placeholders::_4, placeholders::_5, placeholders::_6);
+		videoConfig.reactivateCallback = std::bind(&DShowInstance::OnReactivate, this);
+		videoConfig.format = videoConfig.internalFormat;
+
+		if (!device.SetVideoConfig(&videoConfig)) {
+			blog(LOG_WARNING, "DShowInstance: device.SetVideoConfig failed");
+			return false;
+		}
+
+		if (!videoConfig.cx || !videoConfig.cy_abs) {
+			blog(LOG_ERROR, "DShowInstance: Frame width or height are zero (%" PRIu32 "x%" PRIu32 ")",
+				videoConfig.cx, videoConfig.cy_abs);
+			return false;
+		}
+
+		return true;
+	}
+
+	bool UpdateAudioConfig(obs_data_t* settings)
+	{
+		{
+			CriticalScope scope(mutex);
+			obsAudioAvailable = false;
+		}
+
+
+		string audio_device_id = obs_data_get_string(settings, AUDIO_DEVICE_ID);
+		bool useCustomAudio = obs_data_get_bool(settings, USE_CUSTOM_AUDIO);
+
+		if (useCustomAudio) {
+			DeviceId id;
+			if (!DecodeDeviceId(id, audio_device_id.c_str()))
+				return false;
+
+			audioConfig.name = id.name;
+			audioConfig.path = id.path;
+
+		}
+		else if (!deviceHasAudio) {
+			return true;
+		}
+
+		audioConfig.useVideoDevice = !useCustomAudio && !deviceHasSeparateAudioFilter;
+		audioConfig.useSeparateAudioFilter = deviceHasSeparateAudioFilter;
+		audioConfig.callback = std::bind(&DShowInstance::OnAudioData, this, placeholders::_1, placeholders::_2,
+			placeholders::_3, placeholders::_4, placeholders::_5);
+		audioConfig.mode = (AudioMode)obs_data_get_int(settings, AUDIO_OUTPUT_MODE);
+
+
+		bool ok = device.SetAudioConfig(&audioConfig);
+		{
+			CriticalScope scope(mutex);
+			obsAudioAvailable = ok;
+		}
+
+		return ok;
+	}
+};
+
+static DWORD CALLBACK DShowInstanceThread(LPVOID ptr)
+{
+	DShowInstance* instance = reinterpret_cast<DShowInstance*>(ptr);
+
+	os_set_thread_name("win-dshow: DShowInstanceThread");
+
+	CoInitialize(nullptr);
+	instance->DShowLoop();
+	CoUninitialize();
+	return 0;
 }
 
+class DShowInstanceManager {
+	CriticalSection mutex;
+	std::map<std::string, std::weak_ptr<DShowInstance>> instances;
+
+public:
+	static DShowInstanceManager& Get()
+	{
+		static DShowInstanceManager manager;
+		return manager;
+	}
+
+	std::shared_ptr<DShowInstance> Acquire(obs_data_t* settings, DShowInput* input, bool startNow = true)
+	{
+		std::string videoId = GetDShowVideoId(settings);
+		if (videoId.empty())
+			return nullptr;
+
+		std::shared_ptr<DShowInstance> inst;
+		bool created = false;
+
+		{
+			CriticalScope scope(mutex);
+
+			auto it = instances.find(videoId);
+			if (it != instances.end())
+				inst = it->second.lock();
+
+			if (!inst) {
+				try {
+					inst = std::make_shared<DShowInstance>(videoId);
+				}
+				catch (const char* error) {
+					blog(LOG_ERROR, "DShowInstance create failed: %s", error);
+					return nullptr;
+				}
+
+				instances[videoId] = inst;
+				created = true;
+			}
+			inst->AddSubscriber(input);
+		}
+
+		bool shouldStart = created;
+
+		if (!shouldStart && !inst->IsGraphRunning() && input && input->active) {
+			if (!input->deactivateWhenNotShowing || input->showing)
+				shouldStart = true;
+		}
+
+		if (startNow && shouldStart) {
+			if (!inst->Reconfigure(settings)) {
+				Release(inst, input);
+				return nullptr;
+			}
+		}
+
+		return inst;
+	}
+
+	bool Reconfigure(std::shared_ptr<DShowInstance> inst, obs_data_t* settings)
+	{
+		if (!inst)
+			return false;
+
+		return inst->Reconfigure(settings);
+	}
+
+	void Release(std::shared_ptr<DShowInstance> inst, DShowInput* input)
+	{
+		if (!inst)
+			return;
+
+		std::string key = inst->Key();
+
+		{
+
+			CriticalScope scope(mutex);
+
+			inst->RemoveSubscriber(input);
+
+			if (inst->SubscriberCount() == 0) {
+
+				auto it = instances.find(key);
+				if (it != instances.end()) {
+					auto cur = it->second.lock();
+					if (!cur || cur == inst)
+						instances.erase(it);
+				}
+			}
+		}
+	}
+
+	std::shared_ptr<DShowInstance> Find(const std::string& videoId)
+	{
+		CriticalScope scope(mutex);
+
+		auto it = instances.find(videoId);
+		if (it == instances.end())
+			return nullptr;
+
+		return it->second.lock();
+	}
+};
+/* DSHOW Instance - END */
+
+
+/* DSHOW Instance - BEGIN */
 void DShowInput::SetActive(bool active_)
 {
-	obs_data_t *settings = obs_source_get_settings(source);
-	QueueAction(active_ ? Action::Activate : Action::Deactivate);
+	obs_data_t* settings = obs_source_get_settings(source);
+
 	obs_data_set_bool(settings, "active", active_);
 	active = active_;
+
+	if (!active_) {
+		if (instance)
+			instance->SetSharedDeviceActive(false, settings);
+		else {
+			obs_source_output_video2(source, nullptr);
+			obs_source_set_audio_active(source, false);
+		}
+
+		obs_data_release(settings);
+		return;
+	}
+
+	if (instance) {
+		instance->SetSharedDeviceActive(true, settings);
+	}
+	else if (!deactivateWhenNotShowing || showing) {
+		QueueActivate(settings);
+	}
+
 	obs_data_release(settings);
 }
+/* DSHOW Instance - END */
 
-inline enum video_colorspace DShowInput::GetColorSpace(obs_data_t *settings) const
+inline enum video_colorspace DShowInput::GetColorSpace(obs_data_t* settings) const
 {
-	const char *space = obs_data_get_string(settings, COLOR_SPACE);
+	const char* space = obs_data_get_string(settings, COLOR_SPACE);
 
 	if (astrcmpi(space, "709") == 0)
 		return VIDEO_CS_709;
@@ -1110,9 +1841,9 @@ inline enum video_colorspace DShowInput::GetColorSpace(obs_data_t *settings) con
 	return VIDEO_CS_DEFAULT;
 }
 
-inline enum video_range_type DShowInput::GetColorRange(obs_data_t *settings) const
+inline enum video_range_type DShowInput::GetColorRange(obs_data_t* settings) const
 {
-	const char *range = obs_data_get_string(settings, COLOR_RANGE);
+	const char* range = obs_data_get_string(settings, COLOR_RANGE);
 
 	if (astrcmpi(range, "full") == 0)
 		return VIDEO_RANGE_FULL;
@@ -1121,39 +1852,20 @@ inline enum video_range_type DShowInput::GetColorRange(obs_data_t *settings) con
 	return VIDEO_RANGE_DEFAULT;
 }
 
-inline bool DShowInput::Activate(obs_data_t *settings)
+
+/* DSHOW Instance - BEGIN */
+void DShowInput::SyncSourceConfig(obs_data_t* settings, const VideoConfig& config)
 {
-	if (!device.ResetGraph()) {
-		obs_source_set_audio_active(source, false);
-		return false;
-	}
+	CriticalScope callbackScope(callbackMutex);
 
-	if (!UpdateVideoConfig(settings)) {
-		blog(LOG_WARNING, "%s: Video configuration failed", obs_source_get_name(source));
-		obs_source_set_audio_active(source, false);
-		return false;
-	}
-
-	if (!UpdateAudioConfig(settings))
-		blog(LOG_WARNING,
-		     "%s: Audio configuration failed, ignoring "
-		     "audio",
-		     obs_source_get_name(source));
-
-	if (!device.ConnectFilters())
-		return false;
-
-	Result result = device.Start();
-	//
-	bool used = (Result::InUse == result);
-	bool visibled = obs_data_get_bool(settings, USED_DEVICE);
-	if (used != visibled) {
-		obs_data_set_bool(settings, USED_DEVICE, used);
-		obs_source_update_properties(source);
-	}
-	//
-	if (result != Result::Success)
-		return false;
+	videoConfig = config;
+	deactivateWhenNotShowing = obs_data_get_bool(settings, DEACTIVATE_WNS);
+	flip = obs_data_get_bool(settings, FLIP_IMAGE);
+	autorotation = obs_data_get_bool(settings, AUTOROTATION);
+	hw_decode = obs_data_get_bool(settings, HW_DECODE);
+	sharedAudioOutputMode = (int)obs_data_get_int(settings, AUDIO_OUTPUT_MODE);
+	limitInterval = (int)obs_data_get_int(settings, LIMIT_FRAME);
+	use_limitInterval = obs_data_get_bool(settings, USE_LIMIT_FRAME);
 
 	cs = GetColorSpace(settings);
 	const enum video_range_type range = GetColorRange(settings);
@@ -1171,52 +1883,152 @@ inline bool DShowInput::Activate(obs_data_t *settings)
 		break;
 	case VIDEO_CS_2100_HLG:
 		trc = VIDEO_TRC_HLG;
+		break;
 	}
 
 	frame.range = range;
 	frame.trc = trc;
 
-	bool success = video_format_get_parameters_for_format(cs, range, ConvertVideoFormat(videoConfig.format),
-							      frame.color_matrix, frame.color_range_min,
-							      frame.color_range_max);
-	if (!success) {
-		blog(LOG_ERROR,
-		     "Failed to get video format parameters for "
-		     "video format %u",
-		     cs);
+	video_format_get_parameters_for_format(cs, range, ConvertVideoFormat(videoConfig.format),
+		frame.color_matrix, frame.color_range_min, frame.color_range_max);
+
+	SetupBuffering(settings);
+}
+
+void DShowInput::SyncSourceConfig(const DShowInstanceSettings& settings,
+	const VideoConfig& config)
+{
+	CriticalScope callbackScope(callbackMutex);
+
+	videoConfig = config;
+	sharedAudioOutputMode = settings.audioOutputMode;
+
+	if (astrcmpi(settings.colorSpace.c_str(), "709") == 0)
+		cs = VIDEO_CS_709;
+	else if (astrcmpi(settings.colorSpace.c_str(), "601") == 0)
+		cs = VIDEO_CS_601;
+	else if (astrcmpi(settings.colorSpace.c_str(), "2100PQ") == 0)
+		cs = VIDEO_CS_2100_PQ;
+	else if (astrcmpi(settings.colorSpace.c_str(), "2100HLG") == 0)
+		cs = VIDEO_CS_2100_HLG;
+	else if (videoConfig.format == VideoFormat::P010)
+		cs = VIDEO_CS_2100_PQ;
+	else
+		cs = VIDEO_CS_DEFAULT;
+
+	enum video_range_type range = VIDEO_RANGE_DEFAULT;
+	if (astrcmpi(settings.colorRange.c_str(), "full") == 0)
+		range = VIDEO_RANGE_FULL;
+	else if (astrcmpi(settings.colorRange.c_str(), "partial") == 0)
+		range = VIDEO_RANGE_PARTIAL;
+
+	enum video_trc trc = VIDEO_TRC_DEFAULT;
+	switch (cs) {
+	case VIDEO_CS_DEFAULT:
+	case VIDEO_CS_601:
+	case VIDEO_CS_709:
+	case VIDEO_CS_SRGB:
+		trc = VIDEO_TRC_SRGB;
+		break;
+	case VIDEO_CS_2100_PQ:
+		trc = VIDEO_TRC_PQ;
+		break;
+	case VIDEO_CS_2100_HLG:
+		trc = VIDEO_TRC_HLG;
+		break;
 	}
 
-	return true;
+	frame.range = range;
+	frame.trc = trc;
+
+	video_format_get_parameters_for_format(cs, range, ConvertVideoFormat(videoConfig.format),
+		frame.color_matrix, frame.color_range_min, frame.color_range_max);
+
+	BufferingType bufType = (BufferingType)settings.buffering;
+	bool useBuffering = false;
+	if (bufType == BufferingType::Auto)
+		useBuffering = IsDelayedDevice(videoConfig);
+	else
+		useBuffering = bufType == BufferingType::On;
+
+	obs_source_set_async_unbuffered(source, !useBuffering);
+	obs_source_set_async_decoupled(source, IsDecoupled(videoConfig));
+}
+/* DSHOW Instance - END */
+
+/* DSHOW Instance - BEGIN */
+inline void DShowInput::QueueActivate(obs_data_t* settings)
+{
+	std::string videoId = GetDShowVideoId(settings);
+
+	if (videoId.empty()) {
+		obs_source_output_video2(source, nullptr);
+		obs_source_set_audio_active(source, false);
+		return;
+	}
+
+	if (instance && instance->Key() != videoId) {
+		DShowInstanceManager::Get().Release(instance, this);
+		instance.reset();
+	}
+
+	if (!instance)
+		instance = DShowInstanceManager::Get().Acquire(settings, this, false);
+
+	if (!instance) {
+		obs_source_output_video2(source, nullptr);
+		obs_source_set_audio_active(source, false);
+		return;
+	}
+
+	instance->ReconfigureAsync(settings);
 }
 
 inline void DShowInput::Deactivate()
 {
-	device.ResetGraph();
+	if (instance) {
+		DShowInstanceManager::Get().Release(instance, this);
+		instance.reset();
+	}
+
 	obs_source_output_video2(source, nullptr);
+	obs_source_set_audio_active(source, false);
 }
+/* DSHOW Instance - END */
 
 /* ------------------------------------------------------------------------- */
 
-static const char *GetDShowInputName(void *)
+static const char* GetDShowInputName(void*)
 {
 	return TEXT_INPUT_NAME;
 }
 
-static void proc_activate(void *data, calldata_t *cd)
+static void proc_activate(void* data, calldata_t* cd)
 {
 	bool activate = calldata_bool(cd, "active");
-	DShowInput *input = reinterpret_cast<DShowInput *>(data);
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
 	input->SetActive(activate);
 }
 
-static void *CreateDShowInput(obs_data_t *settings, obs_source_t *source)
+static void proc_video_config(void* data, calldata_t* cd)
 {
-	DShowInput *dshow = nullptr;
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
+
+	if (input && input->instance)
+		input->instance->QueueConfigVideo();
+
+	UNUSED_PARAMETER(cd);
+}
+
+static void* CreateDShowInput(obs_data_t* settings, obs_source_t* source)
+{
+	DShowInput* dshow = nullptr;
 
 	try {
 		dshow = new DShowInput(source, settings);
 		proc_handler_t* ph = obs_source_get_proc_handler(source);
 		proc_handler_add(ph, "void activate(bool active)", proc_activate, dshow);
+		proc_handler_add(ph, "void video_config()", proc_video_config, dshow);
 	}
 	catch (const char* error) {
 		blog(LOG_ERROR, "Could not create device '%s': %s", obs_source_get_name(source), error);
@@ -1225,17 +2037,30 @@ static void *CreateDShowInput(obs_data_t *settings, obs_source_t *source)
 	return dshow;
 }
 
-static void DestroyDShowInput(void *data)
+static void DestroyDShowInput(void* data)
 {
-	delete reinterpret_cast<DShowInput *>(data);
+	delete reinterpret_cast<DShowInput*>(data);
 }
 
-static void UpdateDShowInput(void *data, obs_data_t *settings)
+/* DSHOW Instance - BEGIN */
+static void UpdateDShowInput(void* data, obs_data_t* settings)
 {
-	DShowInput *input = reinterpret_cast<DShowInput *>(data);
-	if (input->active)
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
+	if (!input || !input->active)
+		return;
+
+	input->deactivateWhenNotShowing = obs_data_get_bool(settings, DEACTIVATE_WNS);
+	input->showing = input->source && obs_source_showing(input->source);
+
+	if (!input->deactivateWhenNotShowing || input->showing) {
 		input->QueueActivate(settings);
+		return;
+	}
+
+	if (input->instance)
+		input->instance->NotifyHide(input);
 }
+/* DSHOW Instance - END */
 
 static void GetDShowDefaults(obs_data_t* settings)
 {
@@ -1259,13 +2084,13 @@ struct Resolution {
 	inline Resolution(int cx, int cy) : cx(cx), cy(cy) {}
 };
 
-static void InsertResolution(vector<Resolution> &resolutions, int cx, int cy)
+static void InsertResolution(vector<Resolution>& resolutions, int cx, int cy)
 {
 	int bestCY = 0;
 	size_t idx = 0;
 
 	for (; idx < resolutions.size(); idx++) {
-		const Resolution &res = resolutions[idx];
+		const Resolution& res = resolutions[idx];
 		if (res.cx > cx)
 			break;
 
@@ -1283,7 +2108,7 @@ static void InsertResolution(vector<Resolution> &resolutions, int cx, int cy)
 	resolutions.insert(resolutions.begin() + idx, Resolution(cx, cy));
 }
 
-static inline void AddCap(vector<Resolution> &resolutions, const VideoInfo &cap)
+static inline void AddCap(vector<Resolution>& resolutions, const VideoInfo& cap)
 {
 	InsertResolution(resolutions, cap.minCX, cap.minCY);
 	InsertResolution(resolutions, cap.maxCX, cap.maxCY);
@@ -1299,7 +2124,7 @@ static long long GetOBSFPS()
 }
 
 struct FPSFormat {
-	const char *text;
+	const char* text;
 	long long interval;
 };
 
@@ -1343,7 +2168,7 @@ static const FPSFormat limitFPSFormats[] = {
 
 static bool DeviceIntervalChanged(obs_properties_t* props, obs_property_t* p, obs_data_t* settings);
 
-static bool TryResolution(const VideoDevice &dev, const string &res)
+static bool TryResolution(const VideoDevice& dev, const string& res)
 {
 	int cx, cy;
 	if (!ConvertRes(cx, cy, res.c_str()))
@@ -1352,7 +2177,7 @@ static bool TryResolution(const VideoDevice &dev, const string &res)
 	return ResolutionAvailable(dev, cx, cy);
 }
 
-static bool SetResolution(obs_properties_t *props, obs_data_t *settings, const string &res, bool autoselect = false)
+static bool SetResolution(obs_properties_t* props, obs_data_t* settings, const string& res, bool autoselect = false)
 {
 	if (autoselect)
 		obs_data_set_autoselect_string(settings, RESOLUTION, res.c_str());
@@ -1366,12 +2191,12 @@ static bool SetResolution(obs_properties_t *props, obs_data_t *settings, const s
 	return true;
 }
 
-static bool DeviceResolutionChanged(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+static bool DeviceResolutionChanged(obs_properties_t* props, obs_property_t* p, obs_data_t* settings)
 {
 	UNUSED_PARAMETER(p);
 
-	PropertiesData *data = (PropertiesData *)obs_properties_get_param(props);
-	const char *id;
+	PropertiesData* data = (PropertiesData*)obs_properties_get_param(props);
+	const char* id;
 	VideoDevice device;
 
 	id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
@@ -1392,7 +2217,7 @@ static bool DeviceResolutionChanged(obs_properties_t *props, obs_property_t *p, 
 
 struct VideoFormatName {
 	VideoFormat format;
-	const char *name;
+	const char* name;
 };
 
 static const VideoFormatName videoFormatNames[] = {
@@ -1424,9 +2249,9 @@ static const VideoFormatName videoFormatNames[] = {
 #endif
 };
 
-static bool ResTypeChanged(obs_properties_t *props, obs_property_t *p, obs_data_t *settings);
+static bool ResTypeChanged(obs_properties_t* props, obs_property_t* p, obs_data_t* settings);
 
-static size_t AddDevice(obs_property_t *device_list, const string &id)
+static size_t AddDevice(obs_property_t* device_list, const string& id)
 {
 	DStr name, path;
 	if (!DecodeDeviceDStr(name, path, id.c_str()))
@@ -1435,7 +2260,7 @@ static size_t AddDevice(obs_property_t *device_list, const string &id)
 	return obs_property_list_add_string(device_list, name, id.c_str());
 }
 
-static bool UpdateDeviceList(obs_property_t *list, const string &id)
+static bool UpdateDeviceList(obs_property_t* list, const string& id)
 {
 	size_t size = obs_property_list_item_count(list);
 	bool found = false;
@@ -1470,9 +2295,34 @@ static bool UpdateDeviceList(obs_property_t *list, const string &id)
 	return true;
 }
 
-static bool DeviceSelectionChanged(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+static void UpdateFPS(VideoDevice& device, VideoFormat format,
+	long long interval, int cx, int cy, obs_properties_t* props);
+
+static void UpdateVideoFormats(VideoDevice& device, VideoFormat format,
+	int cx, int cy, long long interval, obs_properties_t* props);
+
+static inline void SetDefaultSharedDeviceSettings(obs_data_t* settings)
 {
-	PropertiesData *data = (PropertiesData *)obs_properties_get_param(props);
+	obs_data_set_int(settings, RES_TYPE, ResType_Preferred);
+	obs_data_set_string(settings, RESOLUTION, "");
+	obs_data_unset_autoselect_value(settings, RESOLUTION);
+	obs_data_set_int(settings, FRAME_INTERVAL, FPS_MATCHING);
+	obs_data_unset_autoselect_value(settings, FRAME_INTERVAL);
+	obs_data_set_int(settings, VIDEO_FORMAT, (int)VideoFormat::Any);
+
+	obs_data_set_string(settings, COLOR_SPACE, "default");
+	obs_data_set_string(settings, COLOR_RANGE, "default");
+	obs_data_set_int(settings, BUFFERING_VAL, (int)BufferingType::Auto);
+	obs_data_set_int(settings, AUDIO_OUTPUT_MODE, (int)AudioMode::Capture);
+	obs_data_set_bool(settings, USE_CUSTOM_AUDIO, false);
+	obs_data_set_string(settings, AUDIO_DEVICE_ID, "");
+}
+
+static bool DeviceSelectionChanged(obs_properties_t* props, obs_property_t* p,
+	obs_data_t* settings)
+{
+	PropertiesData* data =
+		(PropertiesData*)obs_properties_get_param(props);
 	VideoDevice device;
 
 	string id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
@@ -1484,13 +2334,12 @@ static bool DeviceSelectionChanged(obs_properties_t *props, obs_property_t *p, o
 		return !device_list_updated;
 
 	vector<Resolution> resolutions;
-	for (const VideoInfo &cap : device.caps)
+	for (const VideoInfo& cap : device.caps)
 		AddCap(resolutions, cap);
 
 	p = obs_properties_get(props, RESOLUTION);
 	obs_property_list_clear(p);
 
-	bool findRes = false;
 	for (size_t idx = resolutions.size(); idx > 0; idx--) {
 		const Resolution& res = resolutions[idx - 1];
 
@@ -1499,82 +2348,109 @@ static bool DeviceSelectionChanged(obs_properties_t *props, obs_property_t *p, o
 		strRes += "x";
 		strRes += to_string(res.cy);
 
-		//if (device.exposure) {
-			if (res.cx == 1280 && res.cy == 720) {
-				findRes = true;
-			}
-		//}
-
 		obs_property_list_add_string(p, strRes.c_str(), strRes.c_str());
 	}
 
-	bool dev_changed = (id != old_id);
-	if (dev_changed)
-	{
-		if (findRes) {
-			string strRes = "1280x720";
-			obs_data_set_int(settings, RES_TYPE, ResType_Custom);
-			obs_data_set_string(settings, RESOLUTION, strRes.c_str());
-		} else {
-			obs_data_set_int(settings, RES_TYPE, ResType_Preferred);
-		}
-	}
-
 	/* only refresh properties if device legitimately changed */
-	if (!id.size() || !old_id.size() || dev_changed) {
+	if (!id.size() || !old_id.size() || id != old_id) {
+
+		auto inst = DShowInstanceManager::Get().Find(id);
+		if (inst && inst->SubscriberCount() > 0) {
+			SyncPropertySettings(settings, inst->GetSettingsSnapshot());
+		}
+		else
+		{
+			SetDefaultSharedDeviceSettings(settings);
+
+#pragma region _SOOP_OPTIMAL_SETTINGS
+			struct SoopOptimalSettings {
+				std::string resolution; // widthxheight
+				long long interval = 0; // hns
+				long long format = 0;   // VideoFormat
+			};
+
+			// set optimal settings
+			std::unordered_map<std::wstring, SoopOptimalSettings>
+				soop_optimal_settings_list;
+			soop_optimal_settings_list[L"AVerMedia Live Gamer HD 2"] = {
+				"1920x1080", (long long)166666, (long long)VideoFormat::MJPEG }; // 60 FPS, MEDIASUBTYPE_MJPG
+			soop_optimal_settings_list[L"AVerMedia ExtremeCap UVC"] = {
+				"1280x1024", (long long)166666, (long long)VideoFormat::MJPEG }; // 60 FPS, MEDIASUBTYPE_MJPG
+			soop_optimal_settings_list[L"CyberLink YouCam 8"] = {
+				"1920x1080", (long long)333333, (long long)VideoFormat::YUY2 }; // 30 FPS, MEDIASUBTYPE_YUY2
+			soop_optimal_settings_list[L"CyberLink YouCam 9"] = {
+				"1920x1080", (long long)333333, (long long)VideoFormat::YUY2 }; // 30 FPS, MEDIASUBTYPE_YUY2
+			soop_optimal_settings_list[L"Logitech BRIO"] = {
+				"1920x1080", (long long)333333, (long long)VideoFormat::YUY2 }; // 30 FPS, MEDIASUBTYPE_YUY2
+			soop_optimal_settings_list[L"SuperCast T7 4K HDMI"] = {
+				"1920x1080", (long long)166666, (long long)VideoFormat::H264 }; // 60 FPS, MEDIASUBTYPE_H264
+			soop_optimal_settings_list[L"SuperCast U6T HDMI WebCam"] = {
+				"1920x1080", (long long)166666, (long long)VideoFormat::YUY2 }; // 60 FPS, MEDIASUBTYPE_YUY2
+			soop_optimal_settings_list[L"SuperCast U6T Capture"] = {
+				"1920x1080", (long long)166666, (long long)VideoFormat::YUY2 }; // 60 FPS, MEDIASUBTYPE_YUY2
+			soop_optimal_settings_list[L"XSplitBroadcaster"] = {
+				"1920x1080", (long long)333333, (long long)VideoFormat::NV12 }; // 30 FPS, MEDIASUBTYPE_NV12
+			soop_optimal_settings_list[L"XSplit Broadcaster"] = {
+				"1920x1080", (long long)333333, (long long)VideoFormat::NV12 }; // 30 FPS, MEDIASUBTYPE_NV12
+
+			auto it = soop_optimal_settings_list.find(device.name);
+			if (it != soop_optimal_settings_list.end())
+			{
+				obs_data_set_string(settings, RESOLUTION, it->second.resolution.c_str());
+				obs_data_set_int(settings, FRAME_INTERVAL, it->second.interval);
+				obs_data_set_int(settings, VIDEO_FORMAT, it->second.format);
+				obs_data_set_int(settings, RES_TYPE, ResType_Custom);
+			}
+			else if (device.exposure && TryResolution(device, "1280x720"))
+			{
+				obs_data_set_string(settings, RESOLUTION, "1280x720");
+				obs_data_set_int(settings, FRAME_INTERVAL, FPS_MATCHING);        // default
+				obs_data_set_int(settings, VIDEO_FORMAT, (int)VideoFormat::Any); // default
+				obs_data_set_int(settings, RES_TYPE, ResType_Custom);
+			}
+			else
+				obs_data_set_int(settings, RES_TYPE, ResType_Preferred);
+#pragma endregion
+		}
 		p = obs_properties_get(props, RES_TYPE);
 		ResTypeChanged(props, p, settings);
+
+		if ((int)obs_data_get_int(settings, RES_TYPE) == ResType_Preferred) {
+			UpdateVideoFormats(device, VideoFormat::Any, 0, 0, FPS_MATCHING, props);
+			UpdateFPS(device, VideoFormat::Any, FPS_MATCHING, 0, 0, props);
+		}
+
 		obs_data_set_string(settings, LAST_VIDEO_DEV_ID, id.c_str());
 	}
 
-	//ResTypeChanged(props, p, settings);
-
 	return true;
 }
 
-static bool VideoConfigClicked(obs_properties_t *props, obs_property_t *p, void *data)
+static bool VideoConfigClicked(obs_properties_t* props, obs_property_t* p, void* data)
 {
-	DShowInput *input = reinterpret_cast<DShowInput *>(data);
-	input->QueueAction(Action::ConfigVideo);
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
+	if (input && input->instance)
+		input->instance->QueueConfigVideo();
 
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
 	return false;
 }
 
-/*static bool AudioConfigClicked(obs_properties_t *props, obs_property_t *p,
-		void *data)
-{
-	DShowInput *input = reinterpret_cast<DShowInput*>(data);
-	input->QueueAction(Action::ConfigAudio);
 
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	return false;
-}*/
-
-static bool CrossbarConfigClicked(obs_properties_t *props, obs_property_t *p, void *data)
+static bool CrossbarConfigClicked(obs_properties_t* props, obs_property_t* p, void* data)
 {
-	DShowInput *input = reinterpret_cast<DShowInput *>(data);
-	input->QueueAction(Action::ConfigCrossbar1);
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
+	if (input && input->instance)
+		input->instance->QueueConfigCrossbar1();
 
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(p);
 	return false;
 }
 
-/*static bool Crossbar2ConfigClicked(obs_properties_t *props, obs_property_t *p,
-		void *data)
-{
-	DShowInput *input = reinterpret_cast<DShowInput*>(data);
-	input->QueueAction(Action::ConfigCrossbar2);
 
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(p);
-	return false;
-}*/
-
-static bool AddDevice(obs_property_t *device_list, const VideoDevice &device)
+static bool AddDevice(obs_property_t* device_list, const VideoDevice& device)
 {
 	DStr name, path, device_id;
 
@@ -1593,7 +2469,7 @@ static bool AddDevice(obs_property_t *device_list, const VideoDevice &device)
 	return true;
 }
 
-static bool AddAudioDevice(obs_property_t *device_list, const AudioDevice &device)
+static bool AddAudioDevice(obs_property_t* device_list, const AudioDevice& device)
 {
 	DStr name, path, device_id;
 
@@ -1612,12 +2488,12 @@ static bool AddAudioDevice(obs_property_t *device_list, const AudioDevice &devic
 	return true;
 }
 
-static void PropertiesDataDestroy(void *data)
+static void PropertiesDataDestroy(void* data)
 {
-	delete reinterpret_cast<PropertiesData *>(data);
+	delete reinterpret_cast<PropertiesData*>(data);
 }
 
-static bool ResTypeChanged(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+static bool ResTypeChanged(obs_properties_t* props, obs_property_t* p, obs_data_t* settings)
 {
 	int val = (int)obs_data_get_int(settings, RES_TYPE);
 	bool enabled = (val != ResType_Preferred);
@@ -1634,7 +2510,8 @@ static bool ResTypeChanged(obs_properties_t *props, obs_property_t *p, obs_data_
 	if (val == ResType_Custom) {
 		p = obs_properties_get(props, RESOLUTION);
 		DeviceResolutionChanged(props, p, settings);
-	} else {
+	}
+	else {
 		obs_data_unset_autoselect_value(settings, FRAME_INTERVAL);
 	}
 
@@ -1655,7 +2532,7 @@ static DStr GetFPSName(long long interval)
 		return name;
 	}
 
-	for (const FPSFormat &format : validFPSFormats) {
+	for (const FPSFormat& format : validFPSFormats) {
 		if (format.interval != interval)
 			continue;
 
@@ -1667,10 +2544,10 @@ static DStr GetFPSName(long long interval)
 	return name;
 }
 
-static void UpdateFPS(VideoDevice &device, VideoFormat format, long long interval, int cx, int cy,
-		      obs_properties_t *props)
+static void UpdateFPS(VideoDevice& device, VideoFormat format, long long interval, int cx, int cy,
+	obs_properties_t* props)
 {
-	obs_property_t *list = obs_properties_get(props, FRAME_INTERVAL);
+	obs_property_t* list = obs_properties_get(props, FRAME_INTERVAL);
 
 	obs_property_list_clear(list);
 
@@ -1678,13 +2555,13 @@ static void UpdateFPS(VideoDevice &device, VideoFormat format, long long interva
 	obs_property_list_add_int(list, TEXT_FPS_HIGHEST, FPS_HIGHEST);
 
 	bool interval_added = interval == FPS_HIGHEST || interval == FPS_MATCHING;
-	for (const FPSFormat &fps_format : validFPSFormats) {
+	for (const FPSFormat& fps_format : validFPSFormats) {
 		bool video_format_match = false;
 		long long format_interval = fps_format.interval;
 
 		bool available = CapsMatch(device, ResolutionMatcher(cx, cy),
-					   VideoFormatMatcher(format, video_format_match),
-					   FrameRateMatcher(format_interval));
+			VideoFormatMatcher(format, video_format_match),
+			FrameRateMatcher(format_interval));
 
 		if (!available && interval != fps_format.interval)
 			continue;
@@ -1751,7 +2628,7 @@ static void UpdateLimitFPS(obs_properties_t* props,
 static DStr GetVideoFormatName(VideoFormat format)
 {
 	DStr name;
-	for (const VideoFormatName &format_ : videoFormatNames) {
+	for (const VideoFormatName& format_ : videoFormatNames) {
 		if (format_.format == format) {
 			dstr_cat(name, obs_module_text(format_.name));
 			return name;
@@ -1763,22 +2640,22 @@ static DStr GetVideoFormatName(VideoFormat format)
 	return name;
 }
 
-static void UpdateVideoFormats(VideoDevice &device, VideoFormat format_, int cx, int cy, long long interval,
-			       obs_properties_t *props)
+static void UpdateVideoFormats(VideoDevice& device, VideoFormat format_, int cx, int cy, long long interval,
+	obs_properties_t* props)
 {
-	set<VideoFormat> formats = {VideoFormat::Any};
-	auto format_gatherer = [&formats](const VideoInfo &info) mutable -> bool {
+	set<VideoFormat> formats = { VideoFormat::Any };
+	auto format_gatherer = [&formats](const VideoInfo& info) mutable -> bool {
 		formats.insert(info.format);
 		return false;
-	};
+		};
 
 	CapsMatch(device, ResolutionMatcher(cx, cy), FrameRateMatcher(interval), format_gatherer);
 
-	obs_property_t *list = obs_properties_get(props, VIDEO_FORMAT);
+	obs_property_t* list = obs_properties_get(props, VIDEO_FORMAT);
 	obs_property_list_clear(list);
 
 	bool format_added = false;
-	for (const VideoFormatName &format : videoFormatNames) {
+	for (const VideoFormatName& format : videoFormatNames) {
 		bool available = formats.find(format.format) != end(formats);
 
 		if (!available && format.format != format_)
@@ -1798,7 +2675,7 @@ static void UpdateVideoFormats(VideoDevice &device, VideoFormat format_, int cx,
 	obs_property_list_item_disable(list, idx, true);
 }
 
-static bool UpdateFPS(long long interval, obs_property_t *list)
+static bool UpdateFPS(long long interval, obs_property_t* list)
 {
 	size_t size = obs_property_list_item_count(list);
 	DStr name;
@@ -1840,8 +2717,8 @@ static bool DeviceIntervalChanged(obs_properties_t* props, obs_property_t* p, ob
 {
 	long long val = obs_data_get_int(settings, FRAME_INTERVAL);
 
-	PropertiesData *data = (PropertiesData *)obs_properties_get_param(props);
-	const char *id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
+	PropertiesData* data = (PropertiesData*)obs_properties_get_param(props);
+	const char* id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
 	VideoDevice device;
 
 	if (!data->GetDevice(device, id))
@@ -1866,12 +2743,12 @@ static bool DeviceIntervalChanged(obs_properties_t* props, obs_property_t* p, ob
 	bool video_format_matches = false;
 	long long best_interval = numeric_limits<long long>::max();
 	bool frameRateSupported = CapsMatch(device, ResolutionMatcher(cx, cy),
-					    VideoFormatMatcher(format, video_format_matches),
-					    ClosestFrameRateSelector(val, best_interval), FrameRateMatcher(val));
+		VideoFormatMatcher(format, video_format_matches),
+		ClosestFrameRateSelector(val, best_interval), FrameRateMatcher(val));
 
 	if (video_format_matches && !frameRateSupported && best_interval != val) {
 		long long listed_val = 0;
-		for (const FPSFormat &format : validFPSFormats) {
+		for (const FPSFormat& format : validFPSFormats) {
 			long long diff = llabs(format.interval - best_interval);
 			if (diff < DEVICE_INTERVAL_DIFF_LIMIT) {
 				listed_val = format.interval;
@@ -1884,7 +2761,8 @@ static bool DeviceIntervalChanged(obs_properties_t* props, obs_property_t* p, ob
 			val = listed_val;
 		}
 
-	} else {
+	}
+	else {
 		obs_data_unset_autoselect_value(settings, FRAME_INTERVAL);
 	}
 
@@ -1896,7 +2774,7 @@ static bool DeviceIntervalChanged(obs_properties_t* props, obs_property_t* p, ob
 	return true;
 }
 
-static bool UpdateVideoFormats(VideoFormat format, obs_property_t *list)
+static bool UpdateVideoFormats(VideoFormat format, obs_property_t* list)
 {
 	size_t size = obs_property_list_item_count(list);
 	DStr name;
@@ -1923,10 +2801,10 @@ static bool UpdateVideoFormats(VideoFormat format, obs_property_t *list)
 	return true;
 }
 
-static bool VideoFormatChanged(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+static bool VideoFormatChanged(obs_properties_t* props, obs_property_t* p, obs_data_t* settings)
 {
-	PropertiesData *data = (PropertiesData *)obs_properties_get_param(props);
-	const char *id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
+	PropertiesData* data = (PropertiesData*)obs_properties_get_param(props);
+	const char* id = obs_data_get_string(settings, VIDEO_DEVICE_ID);
 	VideoDevice device;
 
 	VideoFormat curFormat = (VideoFormat)obs_data_get_int(settings, VIDEO_FORMAT);
@@ -1948,7 +2826,7 @@ static bool VideoFormatChanged(obs_properties_t *props, obs_property_t *p, obs_d
 	return true;
 }
 
-static bool CustomAudioClicked(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+static bool CustomAudioClicked(obs_properties_t* props, obs_property_t* p, obs_data_t* settings)
 {
 	bool useCustomAudio = obs_data_get_bool(settings, USE_CUSTOM_AUDIO);
 	p = obs_properties_get(props, AUDIO_DEVICE_ID);
@@ -1956,14 +2834,21 @@ static bool CustomAudioClicked(obs_properties_t *props, obs_property_t *p, obs_d
 	return true;
 }
 
-static bool ActivateClicked(obs_properties_t *, obs_property_t *p, void *data)
+static bool ActivateClicked(obs_properties_t*, obs_property_t* p, void* data)
 {
-	DShowInput *input = reinterpret_cast<DShowInput *>(data);
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
+	if (!input)
+		return true;
 
-	if (input->active) {
+	bool currentlyActive = input->active;
+	if (input->instance)
+		currentlyActive = input->instance->IsSharedDeviceActive();
+
+	if (currentlyActive) {
 		input->SetActive(false);
 		obs_property_set_description(p, TEXT_ACTIVATE);
-	} else {
+	}
+	else {
 		input->SetActive(true);
 		obs_property_set_description(p, TEXT_DEACTIVATE);
 	}
@@ -1971,34 +2856,62 @@ static bool ActivateClicked(obs_properties_t *, obs_property_t *p, void *data)
 	return true;
 }
 
-static obs_properties_t *GetDShowProperties(void *obj)
+
+/* Do not sync shared settings here; this dialog may be cancelled. */
+static obs_properties_t* GetDShowProperties(void* obj)
 {
-	DShowInput *input = reinterpret_cast<DShowInput *>(obj);
-	obs_properties_t *ppts = obs_properties_create();
-	PropertiesData *data = new PropertiesData;
+	DShowInput* input = reinterpret_cast<DShowInput*>(obj);
+
+	obs_properties_t* ppts = obs_properties_create();
+	PropertiesData* data = new PropertiesData;
 
 	data->input = input;
 
 	obs_properties_set_param(ppts, data, PropertiesDataDestroy);
 
-	obs_property_t *p = obs_properties_add_list(ppts, VIDEO_DEVICE_ID, TEXT_DEVICE, OBS_COMBO_TYPE_LIST,
-						    OBS_COMBO_FORMAT_STRING);
+	obs_property_t* p = obs_properties_add_list(ppts, VIDEO_DEVICE_ID, TEXT_DEVICE, OBS_COMBO_TYPE_LIST,
+		OBS_COMBO_FORMAT_STRING);
 
 	obs_property_set_modified_callback(p, DeviceSelectionChanged);
 
 	Device::EnumVideoDevices(data->devices);
-	for (const VideoDevice &device : data->devices)
+	for (const VideoDevice& device : data->devices)
 		AddDevice(p, device);
 
-	const char *activateText = TEXT_ACTIVATE;
+	const char* activateText = TEXT_ACTIVATE;
 	if (input) {
-		if (input->active)
+		bool currentlyActive = input->active;
+		if (input->instance)
+			currentlyActive = input->instance->IsSharedDeviceActive();
+
+		if (currentlyActive)
 			activateText = TEXT_DEACTIVATE;
 	}
 
-	obs_properties_add_button(ppts, "activate", activateText, ActivateClicked);
-	obs_properties_add_button(ppts, "video_config", TEXT_CONFIG_VIDEO, VideoConfigClicked);
-	obs_properties_add_button(ppts, "xbar_config", TEXT_CONFIG_XBAR, CrossbarConfigClicked);
+	{
+		obs_properties_t* buttons_group = obs_properties_create();
+		p = fs_properties_add_button_group_item(buttons_group,
+			"activate", activateText, "",
+			0, ActivateClicked,
+			"", 0, 0);
+
+		p = fs_properties_add_button_group_item(buttons_group,
+			"video_config", TEXT_CONFIG_VIDEO, "",
+			1, VideoConfigClicked,
+			"", 0, 0);
+
+		p = fs_properties_add_button_group_item(buttons_group,
+			"xbar_config", TEXT_CONFIG_XBAR, "",
+			2, CrossbarConfigClicked,
+			"", 0, 0);
+
+		p = fs_properties_add_button_group(ppts, buttons_group,
+			"video_group", "", 3, false);
+	}
+
+	//obs_properties_add_button(ppts, "activate", activateText, ActivateClicked);
+	//obs_properties_add_button(ppts, "video_config", TEXT_CONFIG_VIDEO, VideoConfigClicked);
+	//obs_properties_add_button(ppts, "xbar_config", TEXT_CONFIG_XBAR, CrossbarConfigClicked);
 
 	obs_properties_add_bool(ppts, DEACTIVATE_WNS, TEXT_DWNS);
 
@@ -2020,15 +2933,15 @@ static obs_properties_t *GetDShowProperties(void *obj)
 
 	obs_property_set_modified_callback(p, DeviceIntervalChanged);
 
-	//p = obs_properties_add_bool(ppts, USE_LIMIT_FRAME, TEXT_USE_FPS_LIMITED);
-	//obs_property_set_modified_callback(p, UseLimitedFPSChanged);
-	//obs_property_set_visible(p, false);
+	p = obs_properties_add_bool(ppts, USE_LIMIT_FRAME, TEXT_USE_FPS_LIMITED);
+	obs_property_set_modified_callback(p, UseLimitedFPSChanged);
+	obs_property_set_visible(p, false);
 
-	//p = obs_properties_add_list(ppts, LIMIT_FRAME, TEXT_FPS_LIMITED, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-	//for (const FPSFormat& fps_format : limitFPSFormats) {
-	//	obs_property_list_add_int(p, fps_format.text, fps_format.interval);
-	//}
-	//obs_property_set_visible(p, false);
+	p = obs_properties_add_list(ppts, LIMIT_FRAME, TEXT_FPS_LIMITED, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	for (const FPSFormat& fps_format : limitFPSFormats) {
+		obs_property_list_add_int(p, fps_format.text, fps_format.interval);
+	}
+	obs_property_set_visible(p, false);
 
 	p = obs_properties_add_list(ppts, VIDEO_FORMAT, TEXT_VIDEO_FORMAT, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 
@@ -2065,7 +2978,7 @@ static obs_properties_t *GetDShowProperties(void *obj)
 	Device::EnumAudioDevices(data->audioDevices);
 
 	p = obs_properties_add_list(ppts, AUDIO_OUTPUT_MODE, TEXT_AUDIO_MODE, OBS_COMBO_TYPE_LIST,
-				    OBS_COMBO_FORMAT_INT);
+		OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(p, TEXT_MODE_CAPTURE, (int64_t)AudioMode::Capture);
 	obs_property_list_add_int(p, TEXT_MODE_DSOUND, (int64_t)AudioMode::DirectSound);
 	obs_property_list_add_int(p, TEXT_MODE_WAVEOUT, (int64_t)AudioMode::WaveOut);
@@ -2078,15 +2991,15 @@ static obs_properties_t *GetDShowProperties(void *obj)
 	obs_property_set_modified_callback(p, CustomAudioClicked);
 
 	p = obs_properties_add_list(ppts, AUDIO_DEVICE_ID, TEXT_AUDIO_DEVICE, OBS_COMBO_TYPE_LIST,
-				    OBS_COMBO_FORMAT_STRING);
+		OBS_COMBO_FORMAT_STRING);
 
-	for (const AudioDevice &device : data->audioDevices)
+	for (const AudioDevice& device : data->audioDevices)
 		AddAudioDevice(p, device);
 
 	return ppts;
 }
 
-void DShowModuleLogCallback(LogType type, const wchar_t *msg, void *param)
+void DShowModuleLogCallback(LogType type, const wchar_t* msg, void* param)
 {
 	int obs_type = LOG_DEBUG;
 
@@ -2113,21 +3026,46 @@ void DShowModuleLogCallback(LogType type, const wchar_t *msg, void *param)
 	UNUSED_PARAMETER(param);
 }
 
-static void HideDShowInput(void *data)
+/* DSHOW Instance - BEGIN */
+static void HideDShowInput(void* data)
 {
-	DShowInput *input = reinterpret_cast<DShowInput *>(data);
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
 
-	if (input->deactivateWhenNotShowing && input->active)
-		input->QueueAction(Action::Deactivate);
+	if (!input)
+		return;
+
+	input->showing = false;
+
+	if (!input->deactivateWhenNotShowing || !input->active)
+		return;
+
+	if (input->instance)
+		input->instance->NotifyHide(input);
 }
 
-static void ShowDShowInput(void *data)
+static void ShowDShowInput(void* data)
 {
-	DShowInput *input = reinterpret_cast<DShowInput *>(data);
+	DShowInput* input = reinterpret_cast<DShowInput*>(data);
 
-	if (input->deactivateWhenNotShowing && input->active)
-		input->QueueAction(Action::Activate);
+	if (!input)
+		return;
+
+	input->showing = true;
+
+	if (!input->deactivateWhenNotShowing || !input->active)
+		return;
+
+	if (!input->instance) {
+		obs_data_t* settings = obs_source_get_settings(input->source);
+		input->QueueActivate(settings);
+		obs_data_release(settings);
+		return;
+	}
+
+	if (input->instance)
+		input->instance->NotifyShow(input);
 }
+/* DSHOW Instance - END */
 
 void RegisterDShowSource()
 {

@@ -441,8 +441,8 @@ static void duplicate_filters(obs_source_t *dst, obs_source_t *src, bool private
 	for (size_t i = 0; i < src->filters.num; i++) {
 		obs_source_t *s = obs_source_get_ref(src->filters.array[i]);
 		const char* id = obs_source_get_id(s);
-		if (strcmp(id, "soop_shader_filter") == 0)
-			continue;
+		//if (strcmp(id, "soop_shader_filter") == 0)
+		//	continue;
 
 		if (strcmp(id, "soop-video-sync-filter") == 0)
 			continue;
