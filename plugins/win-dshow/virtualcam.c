@@ -46,7 +46,7 @@ static bool virtualcam_start(void *data)
 	char res[64];
 	snprintf(res, sizeof(res), "%dx%dx%lld", (int)width, (int)height, (long long)interval);
 
-	char *res_file = os_get_config_path_ptr("obs-virtualcam.txt");
+	char *res_file = os_get_config_path_ptr("soop-virtualcam.txt");
 	os_quick_write_utf8_file_safe(res_file, res, strlen(res), false, "tmp", NULL);
 	bfree(res_file);
 

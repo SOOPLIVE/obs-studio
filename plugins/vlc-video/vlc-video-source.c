@@ -3,6 +3,7 @@
 #include <util/threading.h>
 #include <util/platform.h>
 #include <util/dstr.h>
+#include <graphics/image-file.h>
 
 #define do_log(level, format, ...) \
 	blog(level, "[vlc_source: '%s'] " format, obs_source_get_name(ss->source), ##__VA_ARGS__)
@@ -22,6 +23,10 @@
 #define S_TRACK                        "track"
 #define S_SUBTITLE_ENABLE              "subtitle_enable"
 #define S_SUBTITLE_TRACK               "subtitle"
+
+#define S_MAKING_BLIND		       "make_blind"
+#define S_SHOW_BLIND		       "show_blind"
+#define S_BLIND_IMAGE_PATH	       "blind_image_path"
 
 #define T_(text) obs_module_text(text)
 #define T_PLAYLIST                     T_("Playlist")
@@ -74,6 +79,18 @@ struct vlc_source {
 	obs_hotkey_id stop_hotkey;
 	obs_hotkey_id playlist_next_hotkey;
 	obs_hotkey_id playlist_prev_hotkey;
+
+	//
+	bool is_first_frame;
+
+	// for tvcable source
+	bool use_blind;
+	bool making_blind;
+	bool show_blind;
+
+	char* blind_image_path;
+	struct obs_source_frame* blind_frame;
+	gs_image_file4_t if4_blind;
 };
 
 static libvlc_media_t *get_media(media_file_array_t *files, const char *path)
@@ -336,6 +353,9 @@ static void vlcs_destroy(void *data)
 {
 	struct vlc_source *c = data;
 
+	if (c->blind_frame)
+		obs_source_frame_free(c->blind_frame);
+
 	if (c->media_list_player) {
 		libvlc_media_list_player_stop_(c->media_list_player);
 		libvlc_media_list_player_release_(c->media_list_player);
@@ -350,6 +370,7 @@ static void vlcs_destroy(void *data)
 	free_files(&c->files);
 	pthread_mutex_destroy(&c->mutex);
 	bfree(c);
+
 }
 
 static void *vlcs_video_lock(void *data, void **planes)
@@ -415,7 +436,18 @@ static void calculate_display_size(struct vlc_source *c, unsigned *width, unsign
 				break;
 			}
 		}
+#pragma region _SOOP_VLC
+		video_t *video = obs_get_video();
+		const struct video_output_info *info = video_output_get_info(video);
+		if ((*width > info->width) || (*height > info->height)) { // 비디오 해상도 보다 큰 경우, 비율을 유지하면서 리사이즈
+			double width_ratio = (double)(info->width) / *width;
+			double height_ratio = (double)(info->height) / *height;
+			double scale = width_ratio < height_ratio ? width_ratio : height_ratio;
 
+			*width = (unsigned)(*width * scale);
+			*height = (unsigned)(*height * scale);
+		}
+#pragma endregion
 		libvlc_media_tracks_release_(tracks, count);
 	}
 
@@ -447,9 +479,27 @@ static unsigned vlcs_video_format(void **p_data, char *chroma, unsigned *width, 
 
 		c->frame.format = new_format;
 		c->frame.full_range = new_range;
+
 		range = c->frame.full_range ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
 		video_format_get_parameters_for_format(VIDEO_CS_DEFAULT, range, new_format, c->frame.color_matrix,
-						       c->frame.color_range_min, c->frame.color_range_max);
+			 				   c->frame.color_range_min, c->frame.color_range_max);
+
+
+		obs_data_t* settings = obs_source_get_settings(c->source);
+
+		int origin_w = (int)obs_data_get_int(settings, "origin_width");
+		int origin_h = (int)obs_data_get_int(settings, "origin_height");
+
+		if (origin_w != c->frame.width || origin_h != c->frame.height) {
+			obs_data_set_int(settings, "origin_width", c->frame.width);
+			obs_data_set_int(settings, "origin_height", c->frame.height);
+		}
+
+		if (!c->is_first_frame) {
+			obs_data_t* settings = obs_source_get_settings(c->source);
+			obs_source_media_file_load(c->source, c->frame.width, c->frame.height);
+			c->is_first_frame = true;
+		}
 	}
 
 	while (c->frame.data[i]) {
@@ -464,6 +514,12 @@ static unsigned vlcs_video_format(void **p_data, char *chroma, unsigned *width, 
 static void vlcs_audio_play(void *data, const void *samples, unsigned count, int64_t pts)
 {
 	struct vlc_source *c = data;
+
+	if (c->use_blind) {
+		if (c->show_blind)
+			return;
+	}
+
 	size_t size = get_audio_size(c->audio.format, c->audio.speakers, count);
 
 	if (c->audio_capacity < count) {
@@ -472,9 +528,24 @@ static void vlcs_audio_play(void *data, const void *samples, unsigned count, int
 	}
 
 	memcpy((void *)c->audio.data[0], samples, size);
+#pragma region _SOOP_VLC
+	pts -= 2000000; // HLS 재생 시작 시 오디오 잘리는 문제 수정 (틀어진 싱크를 보정)
+#pragma endregion
 	c->audio.timestamp = (uint64_t)pts * 1000ULL - time_start;
 	c->audio.frames = count;
+#if 0
+        FILE* pFile = _fsopen("D:\\temp\\test.pcm", "ab", _SH_DENYNO);
+        if (pFile == NULL) {
+        blog(LOG_ERROR, "%s (%d) : pFile : %d", __FILE__, __LINE__, pFile);
+        return;
+        }
 
+        if (fwrite(c->audio.data[0], 1, size, pFile) != size)
+        blog(LOG_ERROR, "%s (%d) : ERROR", __FILE__, __LINE__);
+
+        if (fclose(pFile))
+        blog(LOG_ERROR, "%s (%d) : ERROR", __FILE__, __LINE__);
+#endif // 0
 	obs_source_output_audio(c->source, &c->audio);
 }
 
@@ -530,8 +601,20 @@ static void add_file(struct vlc_source *c, media_file_array_t *new_files, const 
 	if (new_media) {
 		if (is_url) {
 			struct dstr network_caching_option = {0};
-			dstr_catf(&network_caching_option, ":network-caching=%d", network_caching);
-			libvlc_media_add_option_(new_media, network_caching_option.array);
+			dstr_catf(&network_caching_option,
+				  ":network-caching=%d", network_caching);
+			libvlc_media_add_option_(new_media,
+						 network_caching_option.array);
+#pragma region _SOOP_VLC
+			libvlc_media_add_option_(new_media,
+				":no-avcodec-hurry-up"); // 재생 시작 시 화면이 깨지는 문제 해결 (깨지는 부분을 건너 뜀)
+			libvlc_media_add_option_(
+				new_media,
+				":audio-desync=2000"); // HLS 재생 시작 시 오디오가 잘리는 문제 수정 (문제는 해결 되지만 싱크가 틀어지기 때문에 vlcs_audio_play 에서 pts 수정)
+			libvlc_media_add_option_(
+				new_media,
+				":adaptive-use-access"); // HLS 재생 중 네트워크 단절 시 행 발생 문제 수정 (https://wiki.videolan.org/VLC_command-line_help/)
+#pragma endregion
 			dstr_free(&network_caching_option);
 		}
 		struct dstr track_option = {0};
@@ -914,8 +997,8 @@ static void vlcs_playlist_prev_hotkey(void *data, obs_hotkey_id id, obs_hotkey_t
 static void *vlcs_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct vlc_source *c = bzalloc(sizeof(*c));
+	c->is_first_frame = false;
 	c->source = source;
-
 	c->play_pause_hotkey = obs_hotkey_register_source(source, "VLCSource.PlayPause", obs_module_text("PlayPause"),
 							  vlcs_play_pause_hotkey, c);
 
@@ -1168,3 +1251,442 @@ struct obs_source_info vlc_source_info = {
 	.media_set_time = vlcs_set_time,
 	.media_get_state = vlcs_get_state,
 };
+#pragma region _SOOP_VLC
+static const char *getname_anivod_source(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("SOOP.AnimationSource");
+}
+
+static const char *getname_sportvod_source(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("SOOP.SportVODSource");
+}
+
+static const char *getname_dramavod_source(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("SOOP.DramaVODSource");
+}
+
+static const char *getname_movievod_source(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("SOOP.MovieVODSource");
+}
+
+static const char* getname_directbroad_source(void* unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("SOOP.DirectBroad");
+}
+
+static const char* getname_tv_cable_source(void* unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_module_text("SOOP.TvLiveSource");
+}
+
+static void *soop_vod_source_create(obs_data_t *settings, obs_source_t *source)
+{
+	struct vlc_source *c = vlcs_create(settings, source);
+	if (c != NULL)
+		libvlc_audio_set_callbacks_(c->media_player, vlcs_audio_play,
+					    NULL, NULL, NULL, NULL, c);
+	return c;
+}
+
+static void* soop_tvcable_source_create(obs_data_t* settings, obs_source_t* source)
+{
+	struct vlc_source* c = soop_vod_source_create(settings, source);
+	c->use_blind = true;
+	c->show_blind = false;
+
+	return c;
+}
+
+static void soop_vod_source_update(void *data, obs_data_t *settings)
+{
+	struct vlc_source* c = data;
+
+	if (c->use_blind) {
+		c->making_blind = obs_data_get_bool(settings, S_MAKING_BLIND);
+		if (c->show_blind && !obs_data_get_bool(settings, S_SHOW_BLIND)) {
+			if (c->blind_frame)
+				obs_source_frame_free(c->blind_frame);
+		}
+		c->show_blind = obs_data_get_bool(settings, S_SHOW_BLIND);
+
+		const char* blind_image_path = obs_data_get_string(settings, S_BLIND_IMAGE_PATH);
+		bfree(c->blind_image_path);
+		c->blind_image_path = blind_image_path ? bstrdup(blind_image_path) : NULL;;
+	}
+
+	obs_data_t *new_settings = obs_data_create();
+	vlcs_defaults(new_settings);
+
+	// input (ffmpeg_source) -> value (vlc_source)
+
+	const char *pszInput = obs_data_get_string(settings, "input");
+	if ((pszInput != NULL) && (strlen(pszInput) > 0)) {
+		obs_data_array_t *array = obs_data_array_create();
+		obs_data_t *item = obs_data_create();
+		obs_data_set_string(item, "value", pszInput);
+		obs_data_set_int(item, "origin_width", 0);
+		obs_data_set_int(item, "origin_height", 0);
+		obs_data_array_push_back(array, item);
+		obs_data_release(item);
+		obs_data_set_array(new_settings, S_PLAYLIST, array);
+
+		obs_data_array_release(array);
+
+		c->is_first_frame = false;
+	}
+
+	// looping (ffmpeg_source) -> S_LOOP (vlc_source)
+
+	obs_data_set_bool(new_settings, S_LOOP,
+			  obs_data_get_bool(settings, "looping"));
+
+	//
+
+	vlcs_update(data, new_settings);
+	if (c != NULL) {
+		if (obs_source_get_width(c->source) == 0) {
+			int origin_width = (int)obs_data_get_int(settings, "origin_width");
+			int origin_height = (int)obs_data_get_int(settings, "origin_height");
+
+			soop_source_empty_video(c->source, origin_width, origin_height);
+		}
+	}
+	obs_data_release(new_settings);
+}
+
+static void soop_vod_source_defaults(obs_data_t *settings) {
+	vlcs_defaults(settings);
+	obs_data_set_default_int(settings, S_NETWORK_CACHING, 1000);
+
+	obs_data_set_default_bool(settings, S_MAKING_BLIND, false);
+	obs_data_set_default_bool(settings, S_SHOW_BLIND, false);
+
+	obs_data_set_default_int(settings, "origin_width", 0);
+	obs_data_set_default_int(settings, "origin_height", 0);
+}
+
+static void soop_vod_source_activate(void *data) {
+	struct vlc_source *c = data;
+	if (c != NULL) {
+		if (c->behavior == BEHAVIOR_PAUSE_UNPAUSE) { // 이전 상태 확인 (일시 정지)
+			enum obs_media_state state = vlcs_get_state(data);
+			if (state != OBS_MEDIA_STATE_PAUSED) // 현재 상태 확인 (일시 정지 아님)
+				libvlc_media_list_player_pause_(c->media_list_player); // 일시 정지
+
+		} else { // 이전 상태 확인 (일시 정지 아님)
+			enum obs_media_state state = vlcs_get_state(data);
+			if (state == OBS_MEDIA_STATE_PAUSED) // 현재 상태 확인 (일시 정지)
+				libvlc_media_list_player_play_(c->media_list_player); // 재생
+		}
+	}
+}
+
+static void soop_vod_source_deactivate(void *data) {
+	enum obs_media_state state = vlcs_get_state(data);
+	if (state == OBS_MEDIA_STATE_PAUSED) { // 현재 상태 확인 (일시 정지)
+		struct vlc_source *c = data;
+		if (c != NULL)
+			c->behavior = BEHAVIOR_PAUSE_UNPAUSE; // 현재 상태 저장
+	}
+	else { // 현재 상태 확인 (일시 정지 아님)
+		struct vlc_source *c = data;
+		if (c != NULL) {
+			c->behavior = BEHAVIOR_STOP_RESTART; // 현재 상태 저장
+			libvlc_media_list_player_pause_(c->media_list_player); // 일시 정지
+		}
+	}
+}
+
+static void soop_rtmp_source_activate(void* data) {
+	struct vlc_source* c = data;
+	if (c != NULL) {
+		//libvlc_media_list_player_play_(c->media_list_player);
+	}
+}
+
+static void soop_vod_source_stop(void* data) {
+	struct vlc_source* c = data;
+	if (c != NULL) {
+		libvlc_media_list_player_stop_(c->media_list_player);
+		//obs_source_output_video(c->source, NULL); // 크기를 유지 하지 못함
+		soop_source_empty_video(c->source, obs_source_get_width(c->source), obs_source_get_height(c->source)); // 크기를 유지한 상태에서 검은 화면 처리
+	}
+}
+
+static void soop_rtmp_source_deactivate(void* data) {
+	struct vlc_source* c = data;
+	if (c != NULL) {
+		//libvlc_media_list_player_stop_(c->media_list_player);
+		soop_vod_source_stop(c);
+	}
+}
+
+static bool make_blind_frame(struct vlc_source* source)
+{
+	if (!source || !source->blind_image_path)
+		return false;
+
+	obs_enter_graphics();
+	gs_image_file4_free(&source->if4_blind);
+	obs_leave_graphics();
+
+	gs_image_file4_init(&source->if4_blind,
+		source->blind_image_path,
+		GS_IMAGE_ALPHA_PREMULTIPLY);
+
+	obs_enter_graphics();
+	gs_image_file4_init_texture(&source->if4_blind);
+	obs_leave_graphics();
+
+	struct gs_image_file* const image = &source->if4_blind.image3.image2.image;
+	gs_texture_t* texture = image->texture;
+	if (!texture)
+		return false;
+
+	obs_enter_graphics();
+
+	uint32_t width = gs_texture_get_width(texture);
+	uint32_t height = gs_texture_get_height(texture);
+	enum gs_color_format cf = gs_texture_get_color_format(texture);
+
+	gs_stagesurf_t* stagesurf = gs_stagesurface_create(width, height, cf);
+	if (!stagesurf) {
+		obs_leave_graphics();
+		return false;
+	}
+
+	gs_stage_texture(stagesurf, texture);
+
+	uint8_t* mapped = NULL;
+	uint32_t linesize = 0;
+
+	if (!gs_stagesurface_map(stagesurf, &mapped, &linesize)) {
+		obs_leave_graphics();
+		gs_stagesurface_destroy(stagesurf);
+		return false;
+	}
+
+	if (source->blind_frame)
+		obs_source_frame_free(source->blind_frame);
+
+
+	source->blind_frame = obs_source_frame_create(VIDEO_FORMAT_RGBA, width, height);
+	if (!source->blind_frame) {
+		gs_stagesurface_unmap(stagesurf);
+		obs_leave_graphics();
+		gs_stagesurface_destroy(stagesurf);
+		return false;
+	}
+
+	memcpy(source->blind_frame->data[0], mapped, (size_t)height * linesize);
+
+	gs_stagesurface_unmap(stagesurf);
+	obs_leave_graphics();
+	gs_stagesurface_destroy(stagesurf);
+
+	obs_source_output_video(source->source, source->blind_frame);
+
+	obs_data_t* settings = obs_source_get_settings(source->source);
+
+	int origin_w = (int)obs_data_get_int(settings, "origin_width");
+	int origin_h = (int)obs_data_get_int(settings, "origin_height");
+
+	if (origin_w != width || origin_h != height) {
+		obs_data_set_int(settings, "origin_width", width);
+		obs_data_set_int(settings, "origin_height", height);
+	}
+
+	if (!source->is_first_frame) {
+		obs_source_media_file_load(source->source, width, height);
+		source->is_first_frame = true;
+	}
+
+	return true;
+}
+
+static void soop_tvcable_source_tick(void* data, float seconds)
+{
+	UNUSED_PARAMETER(seconds);
+
+	struct vlc_source* c = data;
+
+	if (c->making_blind) {
+		make_blind_frame(c);
+		c->making_blind = false;
+	}
+}
+
+struct obs_source_info soop_anivod_source = {
+	.id = "soop_anivod_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_CONTROLLABLE_MEDIA,
+	.get_name = getname_anivod_source,
+	.create = soop_vod_source_create,
+	.destroy = vlcs_destroy,
+	.update = soop_vod_source_update,
+	.get_defaults = soop_vod_source_defaults,
+	.get_properties = vlcs_properties,
+	.activate = soop_vod_source_activate,
+	.deactivate = soop_vod_source_deactivate,
+	.missing_files = vlcs_missingfiles,
+	.icon_type = OBS_ICON_TYPE_MEDIA,
+	.media_play_pause = vlcs_play_pause,
+	.media_restart = vlcs_restart,
+	.media_stop = soop_vod_source_stop,
+	//.media_next = vlcs_playlist_next,
+	//.media_previous = vlcs_playlist_prev,
+	.media_get_duration = vlcs_get_duration,
+	.media_get_time = vlcs_get_time,
+	.media_set_time = vlcs_set_time,
+	.media_get_state = vlcs_get_state,
+};
+
+struct obs_source_info soop_sportvod_source = {
+	.id = "soop_sportvod_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_CONTROLLABLE_MEDIA,
+	.get_name = getname_sportvod_source,
+	.create = soop_vod_source_create,
+	.destroy = vlcs_destroy,
+	.update = soop_vod_source_update,
+	.get_defaults = soop_vod_source_defaults,
+	.get_properties = vlcs_properties,
+	.activate = soop_vod_source_activate,
+	.deactivate = soop_vod_source_deactivate,
+	.missing_files = vlcs_missingfiles,
+	.icon_type = OBS_ICON_TYPE_MEDIA,
+	.media_play_pause = vlcs_play_pause,
+	.media_restart = vlcs_restart,
+	.media_stop = soop_vod_source_stop,
+	//.media_next = vlcs_playlist_next,
+	//.media_previous = vlcs_playlist_prev,
+	.media_get_duration = vlcs_get_duration,
+	.media_get_time = vlcs_get_time,
+	.media_set_time = vlcs_set_time,
+	.media_get_state = vlcs_get_state,
+};
+
+struct obs_source_info soop_dramavod_source = {
+	.id = "soop_dramavod_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_CONTROLLABLE_MEDIA,
+	.get_name = getname_dramavod_source,
+	.create = soop_vod_source_create,
+	.destroy = vlcs_destroy,
+	.update = soop_vod_source_update,
+	.get_defaults = soop_vod_source_defaults,
+	.get_properties = vlcs_properties,
+	.activate = soop_vod_source_activate,
+	.deactivate = soop_vod_source_deactivate,
+	.missing_files = vlcs_missingfiles,
+	.icon_type = OBS_ICON_TYPE_MEDIA,
+	.media_play_pause = vlcs_play_pause,
+	.media_restart = vlcs_restart,
+	.media_stop = soop_vod_source_stop,
+	//.media_next = vlcs_playlist_next,
+	//.media_previous = vlcs_playlist_prev,
+	.media_get_duration = vlcs_get_duration,
+	.media_get_time = vlcs_get_time,
+	.media_set_time = vlcs_set_time,
+	.media_get_state = vlcs_get_state,
+};
+
+struct obs_source_info soop_movievod_source = {
+	.id = "soop_movievod_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_CONTROLLABLE_MEDIA,
+	.get_name = getname_movievod_source,
+	.create = soop_vod_source_create,
+	.destroy = vlcs_destroy,
+	.update = soop_vod_source_update,
+	.get_defaults = soop_vod_source_defaults,
+	.get_properties = vlcs_properties,
+	.activate = soop_vod_source_activate,
+	.deactivate = soop_vod_source_deactivate,
+	.missing_files = vlcs_missingfiles,
+	.icon_type = OBS_ICON_TYPE_MEDIA,
+	.media_play_pause = vlcs_play_pause,
+	.media_restart = vlcs_restart,
+	.media_stop = soop_vod_source_stop,
+	//.media_next = vlcs_playlist_next,
+	//.media_previous = vlcs_playlist_prev,
+	.media_get_duration = vlcs_get_duration,
+	.media_get_time = vlcs_get_time,
+	.media_set_time = vlcs_set_time,
+	.media_get_state = vlcs_get_state,
+};
+
+
+struct obs_source_info soop_directbroad_source = {
+	.id = "soop_directbroad_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_CONTROLLABLE_MEDIA,
+	.get_name = getname_directbroad_source,
+	.create = soop_vod_source_create,
+	.destroy = vlcs_destroy,
+	.update = soop_vod_source_update,
+	.get_defaults = soop_vod_source_defaults,
+	.get_properties = vlcs_properties,
+	.activate = soop_rtmp_source_activate,
+	.deactivate = soop_rtmp_source_deactivate,
+	.missing_files = vlcs_missingfiles,
+	.icon_type = OBS_ICON_TYPE_MEDIA,
+	.media_play_pause = vlcs_play_pause,
+	.media_restart = vlcs_restart,
+	.media_stop = soop_vod_source_stop,
+	//.media_next = vlcs_playlist_next,
+	//.media_previous = vlcs_playlist_prev,
+	.media_get_duration = vlcs_get_duration,
+	.media_get_time = vlcs_get_time,
+	.media_set_time = vlcs_set_time,
+	.media_get_state = vlcs_get_state,
+};
+
+struct obs_source_info soop_tv_cable_source = {
+	.id = "soop_tv_cable_source",
+	.type = OBS_SOURCE_TYPE_INPUT,
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE |
+			OBS_SOURCE_CONTROLLABLE_MEDIA,
+	.get_name = getname_tv_cable_source,
+	.create = soop_tvcable_source_create,
+	.destroy = vlcs_destroy,
+	.update = soop_vod_source_update,
+	.get_defaults = soop_vod_source_defaults,
+	.get_properties = vlcs_properties,
+	.activate = soop_rtmp_source_activate,
+	.deactivate = soop_rtmp_source_deactivate,
+	.video_tick = soop_tvcable_source_tick,
+	.missing_files = vlcs_missingfiles,
+	.icon_type = OBS_ICON_TYPE_MEDIA,
+	.media_play_pause = vlcs_play_pause,
+	.media_restart = vlcs_restart,
+	.media_stop = soop_vod_source_stop,
+	//.media_next = vlcs_playlist_next,
+	//.media_previous = vlcs_playlist_prev,
+	.media_get_duration = vlcs_get_duration,
+	.media_get_time = vlcs_get_time,
+	.media_set_time = vlcs_set_time,
+	.media_get_state = vlcs_get_state,
+};
+
+#pragma endregion

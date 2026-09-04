@@ -384,7 +384,15 @@ struct obs_core_audio {
 	int total_buffering_ticks;
 	int max_buffering_ticks;
 	bool fixed_buffer;
-
+#pragma region _SOOP_MASTER_AUDIO
+	float soop_master_output_volume; // mul
+	bool soop_master_output_muted;
+	float soop_master_input_volume; // mul
+	bool soop_master_input_muted;
+#pragma endregion
+#pragma region _SOOP_OUTPUT_SOURCE_EXCLUSIVE_AUDIO
+	int32_t soop_output_source_exclusive_audio_channel;
+#pragma endregion
 	pthread_mutex_t monitoring_mutex;
 	DARRAY(struct audio_monitor *) monitors;
 	char *monitoring_device_name;
@@ -882,6 +890,9 @@ struct obs_source {
 
 	/* private data */
 	obs_data_t *private_settings;
+#pragma region _SOOP_MASTER_AUDIO
+	uint32_t soop_main_view_channel;
+#pragma endregion
 };
 
 extern struct obs_source_info *get_source_info(const char *id);

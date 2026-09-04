@@ -151,6 +151,7 @@ function(set_target_properties_obs target)
   endif()
 
   target_link_options(${target} PRIVATE "/PDBALTPATH:$<TARGET_PDB_FILE_NAME:${target}>")
+  target_link_options(${target} PRIVATE "$<$<CONFIG:Release>:/MAP>")
   target_install_resources(${target})
 
   get_target_property(target_sources ${target} SOURCES)

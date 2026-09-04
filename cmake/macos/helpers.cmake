@@ -298,6 +298,14 @@ function(set_target_properties_obs target)
           endif()
         endforeach()
 
+        # 단순 빌드를 위해 추가 - SOOPStudio Browser Helper
+        foreach(helper IN ITEMS _gpu_soop _plugin_soop _renderer_soop _soop)
+        if(TARGET OBS::browser-helper${helper})
+          set_property(GLOBAL APPEND PROPERTY _OBS_DEPENDENCIES OBS::browser-helper${helper})
+          list(APPEND cef_items OBS::browser-helper${helper})
+        endif()
+      endforeach()
+
         set_property(GLOBAL APPEND PROPERTY _OBS_FRAMEWORKS ${cef_items})
       endif()
     endif()
@@ -362,6 +370,13 @@ function(target_install_resources target)
         OUTPUT_VARIABLE relative_path
       )
       cmake_path(GET relative_path PARENT_PATH relative_path)
+      
+      # soop-kr locale만 적용 하도록
+      if("${relative_path}" STREQUAL "locale_backup")
+        continue()
+      endif()
+      #
+      
       target_sources(${target} PRIVATE "${data_file}")
       set_property(SOURCE "${data_file}" PROPERTY MACOSX_PACKAGE_LOCATION "Resources/${relative_path}")
       source_group("Resources/${relative_path}" FILES "${data_file}")

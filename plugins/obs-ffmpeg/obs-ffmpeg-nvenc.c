@@ -411,7 +411,7 @@ static void nvenc_defaults_base(enum codec_type codec, obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "bitrate", 2500);
 	obs_data_set_default_int(settings, "max_bitrate", 5000);
-	obs_data_set_default_int(settings, "keyint_sec", 0);
+	obs_data_set_default_int(settings, "keyint_sec", 2);
 	obs_data_set_default_int(settings, "cqp", 20);
 	obs_data_set_default_string(settings, "rate_control", "CBR");
 	obs_data_set_default_string(settings, "preset2", "p5");

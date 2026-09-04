@@ -650,12 +650,21 @@ EXPORT bool obs_video_active(void);
 /** Sets the primary output source for a channel. */
 EXPORT void obs_set_output_source(uint32_t channel, obs_source_t *source);
 
+#pragma region _SOOP_OUTPUT_SOURCE_EXCLUSIVE_AUDIO
+/* obs_set_output_source 에 오디오 독점 여부 추가 */
+EXPORT void soop_set_output_source(uint32_t channel, obs_source_t *source,
+				   bool exclusive_audio);
+#pragma endregion
+
 /**
  * Gets the primary output source for a channel and increments the reference
  * counter for that source.  Use obs_source_release to release.
  */
 EXPORT obs_source_t *obs_get_output_source(uint32_t channel);
-
+#pragma region _SOOP_MASTER_AUDIO
+/* obs_set_output_source 에서 입력한 channel 을 리턴 */
+EXPORT uint32_t obs_get_output_source_channel(obs_source_t *source);
+#pragma endregion
 /**
  * Enumerates all input sources
  *
@@ -744,6 +753,18 @@ EXPORT void obs_render_main_texture_src_color_only(void);
 /** Returns the last main output texture.  This can return NULL if the texture
  * is unavailable. */
 EXPORT gs_texture_t *obs_get_main_texture(void);
+
+/** Sets the master user volume */
+OBS_DEPRECATED EXPORT void obs_set_master_volume(float volume);
+#pragma region _SOOP_MASTER_AUDIO
+EXPORT void soop_set_master_output_volume(float volume); // mul
+EXPORT void soop_set_master_output_muted(bool muted);
+EXPORT void soop_set_master_input_volume(float volume); // mul
+EXPORT void soop_set_master_input_muted(bool muted);
+#pragma endregion
+
+/** Gets the master user volume */
+OBS_DEPRECATED EXPORT float obs_get_master_volume(void);
 
 /** Saves a source to settings data */
 EXPORT obs_data_t *obs_save_source(obs_source_t *source);
@@ -1027,6 +1048,9 @@ EXPORT obs_properties_t *obs_source_properties(const obs_source_t *source);
 EXPORT void obs_source_update(obs_source_t *source, obs_data_t *settings);
 EXPORT void obs_source_reset_settings(obs_source_t *source, obs_data_t *settings);
 
+/** Send script for this source (only browser_source)  */
+EXPORT void obs_source_send_script(obs_source_t* source, const char* script);
+
 /** Renders a video source. */
 EXPORT void obs_source_video_render(obs_source_t *source);
 
@@ -1274,6 +1298,11 @@ enum obs_monitoring_type {
 EXPORT void obs_source_set_monitoring_type(obs_source_t *source, enum obs_monitoring_type type);
 EXPORT enum obs_monitoring_type obs_source_get_monitoring_type(const obs_source_t *source);
 
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+EXPORT void soop_source_set_monitoring_type(obs_source_t* source);
+EXPORT int soop_source_get_monitoring_type(const char* id);
+#pragma endregion
+
 /** Gets private front-end settings data.  This data is saved/loaded
  * automatically.  Returns an incremented reference. */
 EXPORT obs_data_t *obs_source_get_private_settings(obs_source_t *item);
@@ -1321,6 +1350,7 @@ EXPORT void obs_source_draw(gs_texture_t *image, int x, int y, uint32_t cx, uint
  * function!  Use obs_source_output_video2 instead if partial range support is
  * desired for non-YUV video formats.
  */
+EXPORT void soop_source_empty_video(obs_source_t* source, int width, int height);
 EXPORT void obs_source_output_video(obs_source_t *source, const struct obs_source_frame *frame);
 EXPORT void obs_source_output_video2(obs_source_t *source, const struct obs_source_frame2 *frame);
 
@@ -1475,6 +1505,7 @@ EXPORT void obs_source_media_set_time(obs_source_t *source, int64_t ms);
 EXPORT enum obs_media_state obs_source_media_get_state(obs_source_t *source);
 EXPORT void obs_source_media_started(obs_source_t *source);
 EXPORT void obs_source_media_ended(obs_source_t *source);
+EXPORT void obs_source_media_file_load(obs_source_t* source, int width, int height);
 
 /* ------------------------------------------------------------------------- */
 /* Transition-specific functions */

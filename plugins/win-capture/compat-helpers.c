@@ -4,6 +4,7 @@
 #include <util/dstr.h>
 #include <util/platform.h>
 #include <util/windows/window-helpers.h>
+#include <util/curl/curl-helper.h>
 
 #include "compat-helpers.h"
 #include "compat-format-ver.h"

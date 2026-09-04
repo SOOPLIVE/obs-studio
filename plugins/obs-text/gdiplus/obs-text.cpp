@@ -230,10 +230,10 @@ struct TextSource {
 	uint32_t color = 0xFFFFFF;
 	uint32_t color2 = 0xFFFFFF;
 	float gradient_dir = 0;
-	uint32_t opacity = 100;
-	uint32_t opacity2 = 100;
+	uint32_t opacity = 0;
+	uint32_t opacity2 = 0;
 	uint32_t bk_color = 0;
-	uint32_t bk_opacity = 0;
+	uint32_t bk_opacity = 100;
 	Align align = Align::Left;
 	VAlign valign = VAlign::Top;
 	bool gradient = false;
@@ -247,7 +247,7 @@ struct TextSource {
 	bool use_outline = false;
 	float outline_size = 0.0f;
 	uint32_t outline_color = 0;
-	uint32_t outline_opacity = 100;
+	uint32_t outline_opacity = 0;
 
 	bool use_extents = false;
 	bool old_extents = false;
@@ -808,6 +808,13 @@ inline void TextSource::Update(obs_data_t *s)
 	outline_opacity = new_o_opacity;
 	outline_size = roundf(float(new_o_size));
 
+	// Opacity -> Transparency
+	opacity = 100 - opacity;
+	opacity2 = 100 - opacity2;
+	bk_opacity = 100 - bk_opacity;
+	outline_opacity = 100 - outline_opacity;
+	//
+
 	if (strcmp(align_str, S_ALIGN_CENTER) == 0)
 		align = Align::Center;
 	else if (strcmp(align_str, S_ALIGN_RIGHT) == 0)
@@ -1045,15 +1052,15 @@ static void defaults(obs_data_t *settings, int ver)
 	obs_data_set_default_string(settings, S_ALIGN, S_ALIGN_LEFT);
 	obs_data_set_default_string(settings, S_VALIGN, S_VALIGN_TOP);
 	obs_data_set_default_int(settings, S_COLOR, 0xFFFFFF);
-	obs_data_set_default_int(settings, S_OPACITY, 100);
+	obs_data_set_default_int(settings, S_OPACITY, 0);
 	obs_data_set_default_int(settings, S_GRADIENT_COLOR, 0xFFFFFF);
-	obs_data_set_default_int(settings, S_GRADIENT_OPACITY, 100);
+	obs_data_set_default_int(settings, S_GRADIENT_OPACITY, 0);
 	obs_data_set_default_double(settings, S_GRADIENT_DIR, 90.0);
 	obs_data_set_default_int(settings, S_BKCOLOR, 0x000000);
-	obs_data_set_default_int(settings, S_BKOPACITY, 0);
+	obs_data_set_default_int(settings, S_BKOPACITY, 100);
 	obs_data_set_default_int(settings, S_OUTLINE_SIZE, 2);
 	obs_data_set_default_int(settings, S_OUTLINE_COLOR, 0xFFFFFF);
-	obs_data_set_default_int(settings, S_OUTLINE_OPACITY, 100);
+	obs_data_set_default_int(settings, S_OUTLINE_OPACITY, 0);
 	obs_data_set_default_int(settings, S_CHATLOG_LINES, 6);
 	obs_data_set_default_bool(settings, S_EXTENTS_WRAP, true);
 	obs_data_set_default_int(settings, S_EXTENTS_CX, 100);

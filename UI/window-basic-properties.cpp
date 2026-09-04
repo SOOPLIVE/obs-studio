@@ -100,7 +100,8 @@ OBSBasicProperties::OBSBasicProperties(QWidget *parent, OBSSource source_)
 	};
 	uint32_t caps = obs_source_get_output_flags(source);
 	bool drawable_type = type == OBS_SOURCE_TYPE_INPUT || type == OBS_SOURCE_TYPE_SCENE;
-	bool drawable_preview = (caps & OBS_SOURCE_VIDEO) != 0;
+	bool drawable_preview = (caps & OBS_SOURCE_NOT_DRAW_PREVIEW) == 0 &&
+							(caps & OBS_SOURCE_VIDEO) != 0;
 
 	if (drawable_preview && drawable_type) {
 		ui->preview->show();

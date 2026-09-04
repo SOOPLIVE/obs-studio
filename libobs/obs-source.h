@@ -59,6 +59,7 @@ enum obs_icon_type {
 	OBS_ICON_TYPE_BROWSER,
 	OBS_ICON_TYPE_CUSTOM,
 	OBS_ICON_TYPE_PROCESS_AUDIO_OUTPUT,
+	SOOP_ICON_TYPE_SPOUT2,
 };
 
 enum obs_media_state {
@@ -202,6 +203,13 @@ enum obs_media_state {
  * (prefers to rely on defaults first)
  */
 #define OBS_SOURCE_CAP_DONT_SHOW_PROPERTIES (1 << 16)
+
+/**
+ * Source not draw preview
+ */
+#define OBS_SOURCE_NOT_DRAW_PREVIEW (1 << 17)
+
+
 
 /** @} */
 
@@ -546,6 +554,15 @@ struct obs_source_info {
 	 * @param  source  Source that the filter is being added to
 	 */
 	void (*filter_add)(void *data, obs_source_t *source);
+
+	/**
+	* Called when the filter is added to a source
+	*
+	* @param  data    Source data
+	* @param  script  Script data
+	*/
+	void (*send_script)(void* data, void* script);
+
 };
 
 EXPORT void obs_register_source_s(const struct obs_source_info *info, size_t size);

@@ -40,7 +40,7 @@
 typedef BOOL (*PFN_winrt_capture_supported)();
 typedef BOOL (*PFN_winrt_capture_cursor_toggle_supported)();
 typedef struct winrt_capture *(*PFN_winrt_capture_init_window)(BOOL cursor, HWND window, BOOL client_area,
-							       BOOL force_sdr);
+							       BOOL force_sdr, BOOL use_subregion, const RECT *subregion_rect);
 typedef void (*PFN_winrt_capture_free)(struct winrt_capture *capture);
 
 typedef BOOL (*PFN_winrt_capture_active)(const struct winrt_capture *capture);
@@ -132,11 +132,25 @@ static const char *wgc_whole_match_classes[] = {
 	"MSWinPub",          /* Microsoft Publisher */
 	"OfficeApp-Frame",   /* Microsoft 365 Software */
 	"SDL_app",
+	"MSPaintApp",	     /* Microsoft Paint */
+	NULL,
+};
+
+static const char* wgc_match_process[] = {
+	"starcraft.exe",
+	"league of legends.exe",
+	"7daystodie.exe",
+	"among us.exe",
+	"steam.exe",
+	"goose goose duck.exe",
+	"fallguys_client_game.exe",
+	"geegee.exe",
+	"robloxplayerbeta.exe",
 	NULL,
 };
 
 static enum window_capture_method choose_method(enum window_capture_method method, bool wgc_supported,
-						const char *current_class)
+	      				const char *current_class, const char* current_exe)
 {
 	if (!wgc_supported)
 		return METHOD_BITBLT;
@@ -144,7 +158,7 @@ static enum window_capture_method choose_method(enum window_capture_method metho
 	if (method != METHOD_AUTO)
 		return method;
 
-	if (!current_class)
+	if (!current_class || !current_exe)
 		return METHOD_BITBLT;
 
 	const char **class = wgc_partial_match_classes;
@@ -161,6 +175,14 @@ static enum window_capture_method choose_method(enum window_capture_method metho
 			return METHOD_WGC;
 		}
 		class ++;
+	}
+
+	const char** process = wgc_match_process;
+	while (*process) {
+		if (astrcmpi(current_exe, *process) == 0) {
+			return METHOD_WGC;
+		}
+		process++;
 	}
 
 	return METHOD_BITBLT;
@@ -217,7 +239,7 @@ static void update_settings(struct window_capture *wc, obs_data_t *s)
 
 	ms_build_window_strings(window, &wc->class, &wc->title, &wc->executable);
 
-	wc->method = choose_method(method, wgc_supported, wc->class);
+	wc->method = choose_method(method, wgc_supported, wc->class, wc->executable);
 	wc->priority = (enum window_priority)priority;
 	wc->cursor = obs_data_get_bool(s, "cursor");
 	wc->capture_audio = obs_data_get_bool(s, "capture_audio");
@@ -737,7 +759,7 @@ static void wc_tick(void *data, float seconds)
 		if (wc->window && (wc->capture_winrt == NULL)) {
 			if (!wc->previously_failed) {
 				wc->capture_winrt = wc->exports.winrt_capture_init_window(
-					wc->cursor, wc->window, wc->client_area, wc->force_sdr);
+					wc->cursor, wc->window, wc->client_area, wc->force_sdr, FALSE, NULL);
 
 				if (!wc->capture_winrt) {
 					wc->previously_failed = true;

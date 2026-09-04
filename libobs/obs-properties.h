@@ -57,6 +57,10 @@ enum obs_property_type {
 	OBS_PROPERTY_FRAME_RATE,
 	OBS_PROPERTY_GROUP,
 	OBS_PROPERTY_COLOR_ALPHA,
+
+	// freecshot plus
+	OBS_PROPERTY_IMAGE_BUTTON_GROUP,
+	OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM,
 };
 
 enum obs_combo_format {
@@ -187,6 +191,7 @@ EXPORT obs_property_t *obs_properties_add_float_slider(obs_properties_t *props, 
 EXPORT obs_property_t *obs_properties_add_text(obs_properties_t *props, const char *name, const char *description,
 					       enum obs_text_type type);
 
+
 /**
  * Adds a 'path' property.  Can be a directory or a file.
  *
@@ -264,9 +269,12 @@ EXPORT void obs_property_set_enabled(obs_property_t *p, bool enabled);
 EXPORT void obs_property_set_description(obs_property_t *p, const char *description);
 EXPORT void obs_property_set_long_description(obs_property_t *p, const char *long_description);
 
+EXPORT void obs_property_set_label_text(obs_property_t* p, const char* label_text);
+
 EXPORT const char *obs_property_name(obs_property_t *p);
 EXPORT const char *obs_property_description(obs_property_t *p);
 EXPORT const char *obs_property_long_description(obs_property_t *p);
+EXPORT const char* obs_property_label_text(obs_property_t* p);
 EXPORT enum obs_property_type obs_property_get_type(obs_property_t *p);
 EXPORT bool obs_property_enabled(obs_property_t *p);
 EXPORT bool obs_property_visible(obs_property_t *p);
@@ -358,6 +366,36 @@ EXPORT obs_properties_t *obs_property_group_content(obs_property_t *p);
 
 EXPORT enum obs_button_type obs_property_button_type(obs_property_t *p);
 EXPORT const char *obs_property_button_url(obs_property_t *p);
+
+#ifndef SWIG
+OBS_DEPRECATED
+EXPORT enum obs_text_type obs_proprety_text_type(obs_property_t *p);
+#endif
+
+
+EXPORT const char* fs_property_image_button_group_item_path(obs_property_t* p);
+EXPORT const char* fs_property_image_button_group_item_groupname(obs_property_t* p);
+EXPORT int fs_property_image_button_group_item_width(obs_property_t* p);
+EXPORT int fs_property_image_button_group_item_height(obs_property_t* p);
+EXPORT int fs_property_image_button_group_item_idx(obs_property_t* p);
+
+EXPORT obs_properties_t* fs_property_image_button_group_content(obs_property_t* p);
+EXPORT int fs_property_image_button_group_columns(obs_property_t* p);
+
+EXPORT obs_property_t*
+fs_properties_add_image_button_group_item(obs_properties_t* props,
+				const char* name, const char* desc,
+				const char* group_name, const char* path,
+				int width, int height, int idx,
+				obs_property_clicked_t callback);
+
+EXPORT obs_property_t*
+fs_properties_add_image_button_group(obs_properties_t* props,
+			const char* name, const char* description, int column,
+			obs_properties_t* group);
+
+
+EXPORT bool fs_property_image_button_group_item_clicked(obs_property_t* p, void* obj);
 
 #ifdef __cplusplus
 }

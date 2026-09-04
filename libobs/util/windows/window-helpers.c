@@ -230,6 +230,52 @@ static bool is_microsoft_internal_window_exe(const char *exe)
 	return false;
 }
 
+bool is_process_elevated(DWORD dwPid)
+{
+	HANDLE hProcess =
+		OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, dwPid);
+	if (!hProcess)
+		return false;
+
+	HANDLE hToken = NULL;
+	bool elevated = false;
+
+	if (OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+		TOKEN_ELEVATION elevation;
+		DWORD size = sizeof(TOKEN_ELEVATION);
+		if (GetTokenInformation(hToken, TokenElevation, &elevation,
+					sizeof(elevation), &size)) {
+			elevated = (bool)elevation.TokenIsElevated;
+		}
+		CloseHandle(hToken);
+	}
+	CloseHandle(hProcess);
+	return elevated;
+}
+
+bool is_obs_elevated(void)
+{
+	static bool initialized = false;
+	static bool elevated = false;
+
+	if (!initialized) {
+		HANDLE hToken = NULL;
+		if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY,
+				     &hToken)) {
+			TOKEN_ELEVATION elevation;
+			DWORD size = sizeof(TOKEN_ELEVATION);
+			if (GetTokenInformation(hToken, TokenElevation,
+						&elevation, sizeof(elevation),
+						&size)) {
+				elevated = (bool)elevation.TokenIsElevated;
+			}
+			CloseHandle(hToken);
+		}
+		initialized = true;
+	}
+	return elevated;
+}
+
 static void add_window(obs_property_t *p, HWND hwnd, add_window_cb callback)
 {
 	struct dstr class = {0};
@@ -261,7 +307,16 @@ static void add_window(obs_property_t *p, HWND hwnd, add_window_cb callback)
 		return;
 	}
 
-	dstr_printf(&desc, "[%s]: %s", exe.array, title.array);
+	DWORD pid;
+	GetWindowThreadProcessId(hwnd, &pid);
+
+	bool show_admin_tag = is_process_elevated(pid) && !is_obs_elevated();
+
+	if (show_admin_tag) {
+		dstr_printf(&desc, "[🔒 %s]: %s", exe.array, title.array);
+	} else {
+		dstr_printf(&desc, "[%s]: %s", exe.array, title.array);
+	}
 
 	encode_dstr(&title);
 	encode_dstr(&class);

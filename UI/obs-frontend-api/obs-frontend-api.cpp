@@ -10,6 +10,11 @@ void obs_frontend_set_callbacks_internal(obs_frontend_callbacks *callbacks)
 	c.reset(callbacks);
 }
 
+void soop_frontend_set_callbacks_internal(soop_frontend_callbacks* callbacks)
+{
+	c.reset(callbacks);
+}
+
 static inline bool callbacks_valid_(const char *func_name)
 {
 	if (!c) {
@@ -596,4 +601,130 @@ void obs_frontend_add_undo_redo_action(const char *name, const undo_redo_cb undo
 {
 	if (callbacks_valid())
 		c->obs_frontend_add_undo_redo_action(name, undo, redo, undo_data, redo_data, repeatable);
+}
+
+const char* soop_frontend_api_get_version(void)
+{
+	return "1.0.0";
+}
+
+void soop_frontend_add_callback(soop_frontend_cb callback,
+	void* private_data)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			cb_soop->soop_frontend_add_callback(callback, private_data);
+	}
+}
+
+void soop_frontend_remove_callback(soop_frontend_cb callback,
+	void* private_data)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			cb_soop->soop_frontend_remove_callback(callback, private_data);
+	}
+}
+
+void soop_frontend_send_data(void* data)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			cb_soop->soop_frontend_send_data(data);
+	}
+}
+
+void soop_frontend_toogle_main_mic(void)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			cb_soop->soop_frontend_toogle_main_mic();
+	}
+}
+
+void soop_frontend_toogle_main_vol(void)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			cb_soop->soop_frontend_toogle_main_vol();
+	}
+}
+
+bool soop_frontend_main_mic_state(void)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			return cb_soop->soop_frontend_main_mic_state();
+		else
+			return false;
+	}
+	else
+		return false;
+}
+
+bool soop_frontend_main_vol_state(void)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			return cb_soop->soop_frontend_main_vol_state();
+		else
+			return false;
+	}
+	else
+		return false;
+}
+
+void soop_frontend_toogle_channel_sidebar(void)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			cb_soop->soop_frontend_toogle_channel_sidebar();
+	}
+}
+
+void soop_frontend_toogle_lnbmenu(int menuId)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			cb_soop->soop_frontend_toogle_lnbmenu(menuId);
+	}
+}
+
+bool soop_frontend_get_lnbmenu_state(int menuId)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			return cb_soop->soop_frontend_get_lnbmenu_state(menuId);
+		else {
+			return false;
+		}
+	}
+	else {
+		return false;
+	}
+}
+
+bool soop_frontend_add_imageprinter(const char* file, const char* path, int width, int height)
+{
+	if (callbacks_valid()) {
+		soop_frontend_callbacks* cb_soop = dynamic_cast<soop_frontend_callbacks*>(c.get());
+		if (cb_soop)
+			return cb_soop->soop_frontend_add_imageprinter(file, path, width, height);
+		else {
+			return false;
+		}
+	}
+	else {
+		return false;
+	}
 }

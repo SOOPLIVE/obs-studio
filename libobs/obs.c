@@ -869,6 +869,15 @@ static bool obs_init_audio(struct audio_output_info *ai)
 	struct obs_task_info audio_init = {.task = set_audio_thread};
 	deque_push_back(&audio->tasks, &audio_init, sizeof(audio_init));
 
+#pragma region _SOOP_MASTER_AUDIO
+	audio->soop_master_output_volume = (float)1;
+	audio->soop_master_output_muted = false;
+	audio->soop_master_input_volume = (float)1;
+	audio->soop_master_input_muted = false;
+#pragma endregion
+#pragma region _SOOP_OUTPUT_SOURCE_EXCLUSIVE_AUDIO
+	audio->soop_output_source_exclusive_audio_channel = (int32_t)-1;
+#pragma endregion
 	audio->monitoring_device_name = bstrdup("Default");
 	audio->monitoring_device_id = bstrdup("default");
 
@@ -1726,6 +1735,12 @@ obs_source_t *obs_get_output_source(uint32_t channel)
 	return obs_view_get_source(&obs->data.main_view, channel);
 }
 
+#pragma region _SOOP_MASTER_AUDIO
+uint32_t obs_get_output_source_channel(obs_source_t *source)
+{
+	return source ? source->soop_main_view_channel : 0;
+}
+#pragma endregion
 void obs_set_output_source(uint32_t channel, obs_source_t *source)
 {
 	assert(channel < MAX_CHANNELS);
@@ -1755,7 +1770,14 @@ void obs_set_output_source(uint32_t channel, obs_source_t *source)
 	pthread_mutex_unlock(&view->channels_mutex);
 
 	if (source)
+#pragma region _SOOP_MASTER_AUDIO
+	{
+		source->soop_main_view_channel = channel;
+#pragma endregion
 		obs_source_activate(source, MAIN_VIEW);
+#pragma region _SOOP_MASTER_AUDIO
+	}
+#pragma endregion
 
 	if (prev_source) {
 		obs_source_deactivate(prev_source, MAIN_VIEW);
@@ -1763,6 +1785,15 @@ void obs_set_output_source(uint32_t channel, obs_source_t *source)
 	}
 }
 
+#pragma region _SOOP_OUTPUT_SOURCE_EXCLUSIVE_AUDIO
+void soop_set_output_source(uint32_t channel, obs_source_t *source,
+			    bool exclusive_audio)
+{
+	obs->audio.soop_output_source_exclusive_audio_channel =
+		exclusive_audio ? (int32_t)channel : (int32_t)-1;
+	obs_set_output_source(channel, source);
+}
+#pragma endregion
 void obs_enum_sources(bool (*enum_proc)(void *, obs_source_t *), void *param)
 {
 	obs_source_t *source;
@@ -2104,6 +2135,38 @@ gs_texture_t *obs_get_main_texture(void)
 
 	return video->render_texture;
 }
+
+void obs_set_master_volume(float volume)
+{
+	UNUSED_PARAMETER(volume);
+}
+
+#pragma region _SOOP_MASTER_AUDIO
+void soop_set_master_output_volume(float volume)
+{
+	obs->audio.soop_master_output_volume = volume;
+}
+
+void soop_set_master_output_muted(bool muted)
+{
+	obs->audio.soop_master_output_muted = muted;
+}
+
+void soop_set_master_input_volume(float volume)
+{
+	obs->audio.soop_master_input_volume = volume;
+}
+
+void soop_set_master_input_muted(bool muted)
+{
+	obs->audio.soop_master_input_muted = muted;
+}
+#pragma endregion
+float obs_get_master_volume(void)
+{
+	return 1.f;
+}
+
 
 static obs_source_t *obs_load_source_type(obs_data_t *source_data, bool is_private)
 {

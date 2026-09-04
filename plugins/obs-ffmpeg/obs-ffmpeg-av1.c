@@ -229,8 +229,8 @@ static bool av1_encode(void *data, struct encoder_frame *frame, struct encoder_p
 
 void av1_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_int(settings, "bitrate", 2500);
-	obs_data_set_default_int(settings, "keyint_sec", 0);
+	obs_data_set_default_int(settings, "bitrate", 2000);
+	obs_data_set_default_int(settings, "keyint_sec", 2);
 	obs_data_set_default_int(settings, "cqp", 50);
 	obs_data_set_default_string(settings, "rate_control", "CBR");
 	obs_data_set_default_int(settings, "preset", 8);

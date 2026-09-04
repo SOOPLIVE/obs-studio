@@ -22,6 +22,7 @@
 
 static int crashing = 0;
 static void *log_param = NULL;
+static void *api_log_param = NULL;
 static void *crash_param = NULL;
 
 static void def_log_handler(int log_level, const char *format, va_list args, void *param)
@@ -62,6 +63,7 @@ OBS_NORETURN static void def_crash_handler(const char *format, va_list args, voi
 }
 
 static log_handler_t log_handler = def_log_handler;
+static log_handler_t api_log_handler = def_log_handler;
 static void (*crash_handler)(const char *, va_list, void *) = def_crash_handler;
 
 void base_get_log_handler(log_handler_t *handler, void **param)
@@ -72,6 +74,15 @@ void base_get_log_handler(log_handler_t *handler, void **param)
 		*param = log_param;
 }
 
+void base_get_api_log_handler(log_handler_t* handler, void** param)
+{
+	if (handler)
+		*handler = api_log_handler;
+	if (param)
+		*param = api_log_param;
+}
+
+
 void base_set_log_handler(log_handler_t handler, void *param)
 {
 	if (!handler)
@@ -79,6 +90,16 @@ void base_set_log_handler(log_handler_t handler, void *param)
 
 	log_param = param;
 	log_handler = handler;
+}
+
+
+void base_set_api_log_handler(log_handler_t handler, void* param)
+{
+	if (!handler)
+		handler = def_log_handler;
+
+	api_log_param = param;
+	api_log_handler = handler;
 }
 
 void base_set_crash_handler(void (*handler)(const char *, va_list, void *), void *param)
@@ -114,5 +135,19 @@ void blog(int log_level, const char *format, ...)
 
 	va_start(args, format);
 	blogva(log_level, format, args);
+	va_end(args);
+}
+
+void blogva_api(int log_level, const char* format, va_list args)
+{
+	api_log_handler(log_level, format, args, api_log_param);
+}
+
+void blog_api(int log_level, const char* format, ...)
+{
+	va_list args;
+
+	va_start(args, format);
+	blogva_api(log_level, format, args);
 	va_end(args);
 }

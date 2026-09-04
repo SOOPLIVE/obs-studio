@@ -112,6 +112,7 @@ static const char *source_signals[] = {
 	"void media_previous(ptr source)",
 	"void media_started(ptr source)",
 	"void media_ended(ptr source)",
+	"void media_file_load(ptr source, int width, int height)",
 	NULL,
 };
 
@@ -215,6 +216,9 @@ static bool obs_source_init(struct obs_source *source)
 	source->audio_mixers = 0xFF;
 
 	source->private_settings = obs_data_create();
+#pragma region _SOOP_MASTER_AUDIO
+	source->soop_main_view_channel = 0;
+#pragma endregion
 	return true;
 }
 
@@ -436,6 +440,13 @@ static void duplicate_filters(obs_source_t *dst, obs_source_t *src, bool private
 	da_reserve(filters, src->filters.num);
 	for (size_t i = 0; i < src->filters.num; i++) {
 		obs_source_t *s = obs_source_get_ref(src->filters.array[i]);
+		const char* id = obs_source_get_id(s);
+		if (strcmp(id, "soop_shader_filter") == 0)
+			continue;
+
+		if (strcmp(id, "soop-video-sync-filter") == 0)
+			continue;
+
 		if (s)
 			da_push_back(filters, &s);
 	}
@@ -943,6 +954,14 @@ void obs_source_reset_settings(obs_source_t *source, obs_data_t *settings)
 
 	obs_data_clear(source->context.settings);
 	obs_source_update(source, settings);
+}
+
+void obs_source_send_script(obs_source_t* source, const char* script)
+{
+	if (!obs_source_valid(source, "obs_source_send_script"))
+		return;
+
+	source->info.send_script(source->context.data, (void*)script);
 }
 
 void obs_source_update_properties(obs_source_t *source)
@@ -3448,6 +3467,34 @@ static void obs_source_output_video_internal(obs_source_t *source, const struct 
 	pthread_mutex_unlock(&source->async_mutex);
 }
 
+
+void soop_source_empty_video(obs_source_t* source, int width, int height)
+{
+	struct obs_source_frame* frame = (struct obs_source_frame*)malloc(sizeof(struct obs_source_frame));
+	if (!frame) {
+		return;
+	}
+
+	if (width == 0 || height == 0)
+		return;
+
+	frame->width = width;
+	frame->height = height;
+	frame->timestamp = 0;
+	frame->format = VIDEO_FORMAT_RGBA;
+	frame->linesize[0] = width * 4;
+
+	frame->data[0] = (uint8_t*)calloc(1, frame->linesize[0] * height);
+	if (!frame->data[0]) {
+		free(frame);
+		return;
+	}
+
+	obs_source_output_video(source, frame);
+
+	free(frame);
+}
+
 void obs_source_output_video(obs_source_t *source, const struct obs_source_frame *frame)
 {
 	if (destroying(source))
@@ -4849,7 +4896,26 @@ obs_source_t *obs_source_get_filter_by_name(obs_source_t *source, const char *na
 
 size_t obs_source_filter_count(const obs_source_t *source)
 {
+#if 0
 	return obs_source_valid(source, "obs_source_filter_count") ? source->filters.num : 0;
+#else
+	if (obs_source_valid(source, "obs_source_filter_count")) {
+		int filterNum = 0;
+		for (size_t i = 0; i < source->filters.num; i++) {
+			obs_source_t *s = obs_source_get_ref(source->filters.array[i]);
+			const char *id = obs_source_get_id(s);
+			if (strcmp(id, "soop_shader_filter") == 0)
+				continue;
+
+			if (strcmp(id, "soop-video-sync-filter") == 0)
+				continue;
+			filterNum++;
+		}
+		return filterNum;
+	}
+	else
+		return 0;
+#endif
 }
 
 bool obs_source_enabled(const obs_source_t *source)
@@ -5405,6 +5471,8 @@ void obs_source_remove_audio_capture_callback(obs_source_t *source, obs_source_a
 	pthread_mutex_unlock(&source->audio_cb_mutex);
 }
 
+extern bool devices_match(const char *id1, const char *id2);
+
 void obs_source_set_monitoring_type(obs_source_t *source, enum obs_monitoring_type type)
 {
 	struct calldata data;
@@ -5434,7 +5502,6 @@ void obs_source_set_monitoring_type(obs_source_t *source, enum obs_monitoring_ty
 			source->monitor = NULL;
 		}
 	}
-
 	source->monitoring_type = type;
 }
 
@@ -5443,6 +5510,94 @@ enum obs_monitoring_type obs_source_get_monitoring_type(const obs_source_t *sour
 	return obs_source_valid(source, "obs_source_get_monitoring_type") ? source->monitoring_type
 									  : OBS_MONITORING_TYPE_NONE;
 }
+
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+void soop_source_set_monitoring_type(obs_source_t* source)
+{
+	if (source) {
+		const char* id = obs_source_get_id(source);
+		if (id) {
+			int type = soop_source_get_monitoring_type(id);
+			if ((type >= (int)OBS_MONITORING_TYPE_NONE) &&
+				(type <= (int)OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT))
+				obs_source_set_monitoring_type(source, type);
+		}
+	}
+}
+
+extern bool devices_match(const char* id1, const char* id2);
+
+enum obs_monitoring_type soop_desktop_audio_monitoring_type()
+{
+	enum obs_monitoring_type type = OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT;
+
+	//
+
+	for (uint32_t i = 1; i < 3; i++)
+	{
+		obs_source_t* source = obs_get_output_source(i);
+		if (source) {
+			obs_data_t* settings = obs_source_get_settings(source);
+			if (settings) {
+				const char* device_id = obs_data_get_string(settings, "device_id");
+				const char* name = 0;
+				const char* id = 0;
+				obs_get_audio_monitoring_device(&name, &id);
+				if (device_id && id) {
+					if (devices_match(
+						device_id,
+						id))
+						type = OBS_MONITORING_TYPE_MONITOR_ONLY;
+				}
+
+				obs_data_release(settings);
+			}
+
+			obs_source_release(source);
+		}
+	}
+
+	//
+
+	return type;
+}
+
+int soop_source_get_monitoring_type(const char* id)
+{
+	int monitoring_type = -1;
+
+	//
+
+	if (id) {
+		if (!strcmp(id, "game_capture") ||
+			!strcmp(id, "window_capture") ||
+			!strcmp(id, "wasapi_process_output_capture"))
+			monitoring_type = OBS_MONITORING_TYPE_NONE;
+		else if (!strcmp(id, "aja_source") ||
+			!strcmp(id, "decklink-input") ||
+			!strcmp(id, "dshow_input") ||
+			!strcmp(id, "wasapi_input_capture") ||
+			!strcmp(id, "wasapi_output_capture")) 
+			monitoring_type = (int)OBS_MONITORING_TYPE_NONE;
+		else if (!strcmp(id, "obs_stinger_transition")) 
+			monitoring_type = (int)soop_desktop_audio_monitoring_type();
+		else {
+			const struct obs_source_info* info = get_source_info(id);
+			if (info) {
+				if (info->type == OBS_SOURCE_TYPE_INPUT) {
+					uint32_t flags = obs_get_source_output_flags(id);
+					if (flags & OBS_SOURCE_AUDIO)
+						monitoring_type = soop_desktop_audio_monitoring_type();
+				}
+			}
+		}
+	}
+
+	//
+
+	return monitoring_type;
+}
+#pragma endregion
 
 void obs_source_set_async_unbuffered(obs_source_t *source, bool unbuffered)
 {
@@ -5729,6 +5884,23 @@ void obs_source_media_ended(obs_source_t *source)
 		return;
 
 	obs_source_dosignal(source, NULL, "media_ended");
+}
+
+
+void obs_source_media_file_load(obs_source_t* source, int width, int height)
+{
+	if (!obs_source_valid(source, "obs_source_media_file_load"))
+		return;
+
+	struct calldata data;
+	calldata_init(&data);
+	calldata_set_ptr(&data, "source", source);
+	calldata_set_int(&data, "width", width);
+	calldata_set_int(&data, "height", height);
+
+	signal_handler_signal(source->context.signals, "media_file_load", &data);
+
+	calldata_free(&data);
 }
 
 obs_data_array_t *obs_source_backup_filters(obs_source_t *source)

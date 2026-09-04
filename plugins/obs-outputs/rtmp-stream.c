@@ -357,6 +357,9 @@ retry_send:
 
 	if (stream->write_buf_len + len > stream->write_buf_size) {
 
+		info("[FP] write buffer full: used=%d / total=%d, waiting...",
+		     stream->write_buf_len, stream->write_buf_size);
+
 		pthread_mutex_unlock(&stream->write_buf_mutex);
 
 		if (os_event_wait(stream->buffer_space_available_event)) {
@@ -678,6 +681,10 @@ static void *send_thread(void *data)
 		}
 
 		if (sent < 0) {
+			info("[FP] send failed | type: %d | size: %zu | dts_usec: %" PRId64
+			     " | error: %d",
+			     packet.type, packet.size, packet.dts_usec,
+			     stream->rtmp.last_error_code);
 			os_atomic_set_bool(&stream->disconnected, true);
 			break;
 		}
@@ -694,7 +701,10 @@ static void *send_thread(void *data)
 	bool encode_error = os_atomic_load_bool(&stream->encode_error);
 
 	if (disconnected(stream)) {
-		info("Disconnected from %s", stream->path.array);
+		info("[FP] Disconnected from %s | last_error_code: %d | total_sent: %" PRIu64
+		     " bytes",
+		     stream->path.array, stream->rtmp.last_error_code,
+		     stream->total_bytes_sent);
 	} else if (encode_error) {
 		info("Encoder error, disconnecting");
 		send_footers(stream); // Y2023 spec
@@ -1211,6 +1221,8 @@ static int try_connect(struct rtmp_stream *stream)
 #endif
 
 	if (!RTMP_Connect(&stream->rtmp, NULL)) {
+		info("[FP] RTMP_Connect failed | error_code: %d | url: %s",
+		     stream->rtmp.last_error_code, stream->path.array);
 		set_output_error(stream);
 		return OBS_OUTPUT_CONNECT_FAILED;
 	}
@@ -1620,6 +1632,12 @@ static void check_to_drop_frames(struct rtmp_stream *stream, bool pframes)
 			dbr_set_bitrate(stream);
 		}
 		return;
+	}
+
+	if (buffer_duration_usec > drop_threshold / 2) {
+		info("[FP] buffer warning: %" PRId64 " / %" PRId64 " us (%.0f%%)",
+		     buffer_duration_usec, drop_threshold,
+		     (float)buffer_duration_usec / drop_threshold * 100.0f);
 	}
 
 	if (buffer_duration_usec > drop_threshold) {

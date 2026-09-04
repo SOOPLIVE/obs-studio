@@ -49,6 +49,7 @@ target_sources(
     nt-stuff.h
     plugin-main.c
     window-capture.c
+    window-area-capture.c
 )
 
 target_compile_definitions(

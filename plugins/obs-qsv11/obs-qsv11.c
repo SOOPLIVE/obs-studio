@@ -163,7 +163,7 @@ static void obs_qsv_destroy(void *data)
 static void obs_qsv_defaults(obs_data_t *settings, int ver, enum qsv_codec codec)
 {
 	obs_data_set_default_string(settings, "target_usage", "TU4");
-	obs_data_set_default_int(settings, "bitrate", 2500);
+	obs_data_set_default_int(settings, "bitrate", 2000);
 	obs_data_set_default_int(settings, "max_bitrate", 3000);
 	obs_data_set_default_string(settings, "profile", codec == QSV_CODEC_AVC ? "high" : "main");
 	obs_data_set_default_string(settings, "rate_control", "CBR");
@@ -176,7 +176,7 @@ static void obs_qsv_defaults(obs_data_t *settings, int ver, enum qsv_codec codec
 	obs_data_set_default_int(settings, "qpb", 23);
 	obs_data_set_default_int(settings, "icq_quality", 23);
 
-	obs_data_set_default_int(settings, "keyint_sec", 0);
+	obs_data_set_default_int(settings, "keyint_sec", 2);
 	obs_data_set_default_string(settings, "latency", "normal");
 	obs_data_set_default_int(settings, "bframes", 3);
 	obs_data_set_default_bool(settings, "repeat_headers", false);

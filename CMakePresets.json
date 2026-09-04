@@ -17,7 +17,9 @@
         "YOUTUBE_CLIENTID": {"type": "STRING", "value": "$penv{YOUTUBE_CLIENTID}"},
         "YOUTUBE_CLIENTID_HASH": {"type": "STRING", "value": "$penv{YOUTUBE_CLIENTID_HASH}"},
         "YOUTUBE_SECRET": {"type": "STRING", "value": "$penv{YOUTUBE_SECRET}"},
-        "YOUTUBE_SECRET_HASH": {"type": "STRING", "value": "$penv{YOUTUBE_SECRET_HASH}"}
+        "YOUTUBE_SECRET_HASH": {"type": "STRING", "value": "$penv{YOUTUBE_SECRET_HASH}"},
+        "VIRTUALCAM_GUID": {"type": "STRING", "value": "BC5C71ED-2E00-40A4-8A9E-1B9CE71384CB"},
+        "ENABLE_BROWSER": true
       }
     },
     {
@@ -98,12 +100,12 @@
         "lhs": "${hostSystemName}",
         "rhs": "Windows"
       },
-      "architecture": "x64,version=10.0.22621",
+      "architecture": "x64",
       "binaryDir": "${sourceDir}/build_x64",
       "generator": "Visual Studio 17 2022",
       "cacheVariables": {
         "GPU_PRIORITY_VAL": {"type": "STRING", "value": "$penv{GPU_PRIORITY_VAL}"},
-        "VIRTUALCAM_GUID": {"type": "STRING", "value": "A3FCE0F5-3493-419F-958A-ABA1250EC20B"},
+        "VIRTUALCAM_GUID": {"type": "STRING", "value": "BC5C71ED-2E00-40A4-8A9E-1B9CE71384CB"},
         "ENABLE_BROWSER": true
       }
     },

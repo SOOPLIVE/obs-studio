@@ -228,7 +228,8 @@ static void build_flv_meta_data(obs_output_t *context, uint8_t **output, size_t 
 	enc_bool_val(&enc, end, "5.1", audio_output_get_channels(audio) == 6);
 	enc_bool_val(&enc, end, "7.1", audio_output_get_channels(audio) == 8);
 
-	dstr_printf(&encoder_name, "%s (libobs version ", MODULE_NAME);
+	//dstr_printf(&encoder_name, "%s (libobs version ", MODULE_NAME);
+	dstr_printf(&encoder_name, "Soop Studio 2.0.0 (libobs version ");
 
 #ifdef HAVE_OBSCONFIG_H
 	dstr_cat(&encoder_name, obs_get_version_string());

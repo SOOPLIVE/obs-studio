@@ -4,7 +4,7 @@
 #include <initguid.h>
 
 #ifdef VIRTUALCAM_AVAILABLE
-DEFINE_GUID(CLSID_OBS_VirtualVideo,
+DEFINE_GUID(CLSID_SOOP_VirtualVideo,
             0x@GUID_VAL01@,
             0x@GUID_VAL02@,
             0x@GUID_VAL03@,

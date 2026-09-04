@@ -64,6 +64,10 @@ struct ffmpeg_source {
 	enum obs_media_state state;
 	obs_hotkey_pair_id play_pause_hotkey;
 	obs_hotkey_id stop_hotkey;
+
+	bool is_get_first_frame;
+	uint32_t frame_width;
+	uint32_t frame_height;
 };
 
 // Used to safely cancel and join any active reconnect threads
@@ -241,6 +245,15 @@ static void get_frame(void *opaque, struct obs_source_frame *f)
 {
 	struct ffmpeg_source *s = opaque;
 	obs_source_output_video(s->source, f);
+
+	if (!s->is_get_first_frame) {
+		if (0 != f->width && 0 != f->height) {
+			obs_source_media_file_load(s->source, f->width, f->height);
+			s->frame_width = f->width;
+			s->frame_height = f->height;
+			s->is_get_first_frame = true;
+		}
+	}
 }
 
 static void preload_frame(void *opaque, struct obs_source_frame *f)
@@ -275,7 +288,14 @@ static void media_stopped(void *opaque)
 {
 	struct ffmpeg_source *s = opaque;
 	if (s->is_clear_on_media_end && !s->is_track_matte) {
+
 		obs_source_output_video(s->source, NULL);
+
+		if (!s->is_get_first_frame) {
+			s->frame_width = 0;
+			s->frame_height = 0;
+			s->is_get_first_frame = false;
+		}
 	}
 
 	if ((s->close_when_inactive || !s->is_local_file) && s->media)
@@ -322,6 +342,8 @@ static void ffmpeg_source_start(struct ffmpeg_source *s)
 
 	if (!s->media)
 		return;
+
+	s->is_get_first_frame = false;
 
 	media_playback_play(s->media, s->is_looping, s->reconnecting);
 	if (s->is_local_file && media_playback_has_video(s->media) && (s->is_clear_on_media_end || s->is_looping))
@@ -386,7 +408,14 @@ static void ffmpeg_source_tick(void *data, float seconds)
 	}
 }
 
+#define SRT_PROTO "srt"
 #define RIST_PROTO "rist"
+
+static bool requires_mpegts(const char *path)
+{
+	return !astrcmpi_n(path, SRT_PROTO, sizeof(SRT_PROTO) - 1) ||
+	       !astrcmpi_n(path, RIST_PROTO, sizeof(RIST_PROTO) - 1);
+}
 
 static void ffmpeg_source_update(void *data, obs_data_t *settings)
 {
@@ -421,6 +450,10 @@ static void ffmpeg_source_update(void *data, obs_data_t *settings)
 		should_restart_media = true;
 		input = obs_data_get_string(settings, "input");
 		input_format = obs_data_get_string(settings, "input_format");
+		if (requires_mpegts(input)) {
+			input_format = "mpegts";
+			obs_data_set_string(settings, "input_format", "mpegts");
+		}
 		s->reconnect_delay_sec = (int)obs_data_get_int(settings, "reconnect_delay_sec");
 		s->reconnect_delay_sec = s->reconnect_delay_sec == 0 ? 10 : s->reconnect_delay_sec;
 		is_looping = false;
@@ -596,7 +629,9 @@ static void *ffmpeg_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct ffmpeg_source *s = bzalloc(sizeof(struct ffmpeg_source));
 	s->source = source;
-
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+	soop_source_set_monitoring_type(source);
+#pragma endregion
 	// Manual type since the event can be signalled without an active thread
 	if (os_event_init(&s->reconnect_stop_event, OS_EVENT_TYPE_MANUAL)) {
 		FF_BLOG(LOG_ERROR, "Failed to initialize reconnect stop event");
@@ -784,7 +819,8 @@ static obs_missing_files_t *ffmpeg_source_missingfiles(void *data)
 struct obs_source_info ffmpeg_source = {
 	.id = "ffmpeg_source",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE |
+	.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO |
+			OBS_SOURCE_DO_NOT_DUPLICATE |
 			OBS_SOURCE_CONTROLLABLE_MEDIA,
 	.get_name = ffmpeg_source_getname,
 	.create = ffmpeg_source_create,

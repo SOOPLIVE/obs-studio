@@ -41,7 +41,7 @@
 
 typedef BOOL (*PFN_winrt_capture_supported)();
 typedef BOOL (*PFN_winrt_capture_cursor_toggle_supported)();
-typedef struct winrt_capture *(*PFN_winrt_capture_init_monitor)(BOOL cursor, HMONITOR monitor, BOOL force_sdr);
+typedef struct winrt_capture *(*PFN_winrt_capture_init_monitor)(BOOL cursor, HMONITOR monitor, BOOL force_sdr, BOOL use_subregion, const RECT *subregion_rect);
 typedef void (*PFN_winrt_capture_free)(struct winrt_capture *capture);
 
 typedef BOOL (*PFN_winrt_capture_active)(const struct winrt_capture *capture);
@@ -530,15 +530,18 @@ static void duplicator_capture_tick(void *data, float seconds)
 
 				if (capture->handle) {
 					capture->capture_winrt = capture->exports.winrt_capture_init_monitor(
-						capture->capture_cursor, capture->handle, capture->force_sdr);
+							capture->capture_cursor,
+							capture->handle,
+							capture->force_sdr, TRUE, NULL);
 					if (!capture->capture_winrt) {
 						update_monitor_handle(capture);
 
 						if (capture->handle) {
 							capture->capture_winrt =
 								capture->exports.winrt_capture_init_monitor(
-									capture->capture_cursor, capture->handle,
-									capture->force_sdr);
+									capture->capture_cursor,
+									capture->handle,
+									capture->force_sdr, TRUE, NULL);
 						}
 					}
 				}
@@ -762,7 +765,7 @@ static void update_settings_visibility(obs_properties_t *props, struct duplicato
 {
 	pthread_mutex_lock(&capture->update_mutex);
 
-	const enum window_capture_method method = capture->method;
+	const enum display_capture_method method = capture->method;
 	const bool dxgi_options = method == METHOD_DXGI;
 	const bool wgc_options = method == METHOD_WGC;
 
@@ -812,6 +815,11 @@ static obs_properties_t *duplicator_capture_properties(void *data)
 		obs_property_list_item_disable(monitors, 0, true);
 	}
 
+	if (capture && strcmp(capture->monitor_id, INVALID_DISPLAY) == 0) {
+		obs_property_list_add_string(monitors, obs_module_text("SelectADisplay"), INVALID_DISPLAY);
+		obs_property_list_item_disable(monitors, 0, true);
+	}
+
 	obs_properties_add_bool(props, "capture_cursor", TEXT_CAPTURE_CURSOR);
 	obs_properties_add_bool(props, "force_sdr", TEXT_FORCE_SDR);
 
@@ -848,7 +856,8 @@ enum gs_color_space duplicator_capture_get_color_space(void *data, size_t count,
 struct obs_source_info duplicator_capture_info = {
 	.id = "monitor_capture",
 	.type = OBS_SOURCE_TYPE_INPUT,
-	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_SRGB,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW |
+			OBS_SOURCE_DO_NOT_DUPLICATE | OBS_SOURCE_SRGB,
 	.get_name = duplicator_capture_getname,
 	.create = duplicator_capture_create,
 	.destroy = duplicator_capture_destroy,

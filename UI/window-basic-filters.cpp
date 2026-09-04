@@ -134,7 +134,8 @@ OBSBasicFilters::OBSBasicFilters(QWidget *parent, OBSSource source_)
 	enum obs_source_type type = obs_source_get_type(source);
 	bool drawable_type = type == OBS_SOURCE_TYPE_INPUT || type == OBS_SOURCE_TYPE_SCENE;
 
-	if ((caps & OBS_SOURCE_VIDEO) != 0) {
+	if ((caps & OBS_SOURCE_NOT_DRAW_PREVIEW) == 0 &&
+	    (caps & OBS_SOURCE_VIDEO) != 0) {
 		ui->rightLayout->setContentsMargins(0, 0, 0, 0);
 		ui->preview->show();
 		if (drawable_type)

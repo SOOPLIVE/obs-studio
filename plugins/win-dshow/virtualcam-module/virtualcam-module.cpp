@@ -74,7 +74,7 @@ STDMETHODIMP VCamFactory::CreateInstance(LPUNKNOWN parent, REFIID, void **p_ptr)
 		return E_NOINTERFACE;
 	}
 
-	if (IsEqualCLSID(cls, CLSID_OBS_VirtualVideo)) {
+	if (IsEqualCLSID(cls, CLSID_SOOP_VirtualVideo)) {
 		*p_ptr = (void *)new VCamFilter();
 		return S_OK;
 	}
@@ -159,9 +159,9 @@ static bool RegServers(bool reg)
 	}
 
 	if (reg) {
-		return RegServer(CLSID_OBS_VirtualVideo, L"OBS Virtual Camera", file);
+		return RegServer(CLSID_SOOP_VirtualVideo, L"FreecShot Plus Virtual Camera", file);
 	} else {
-		return UnregServer(CLSID_OBS_VirtualVideo);
+		return UnregServer(CLSID_SOOP_VirtualVideo);
 	}
 }
 
@@ -182,14 +182,13 @@ static bool RegFilters(bool reg)
 		rf2.dwMerit = MERIT_DO_NOT_USE;
 		rf2.cPins = 1;
 		rf2.rgPins = &AMSPinVideo;
-
-		hr = fm->RegisterFilter(CLSID_OBS_VirtualVideo, L"OBS Virtual Camera", &moniker,
+		hr = fm->RegisterFilter(CLSID_SOOP_VirtualVideo, L"FreecShot Plus Virtual Camera", &moniker,
 					&CLSID_VideoInputDeviceCategory, nullptr, &rf2);
 		if (FAILED(hr)) {
 			return false;
 		}
 	} else {
-		hr = fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_OBS_VirtualVideo);
+		hr = fm->UnregisterFilter(&CLSID_VideoInputDeviceCategory, 0, CLSID_SOOP_VirtualVideo);
 		if (FAILED(hr)) {
 			return false;
 		}
@@ -254,7 +253,7 @@ STDAPI DllGetClassObject(REFCLSID cls, REFIID riid, void **p_ptr)
 	if (riid != IID_IClassFactory && riid != IID_IUnknown) {
 		return E_NOINTERFACE;
 	}
-	if (!IsEqualCLSID(cls, CLSID_OBS_VirtualVideo)) {
+	if (!IsEqualCLSID(cls, CLSID_SOOP_VirtualVideo)) {
 		return E_INVALIDARG;
 	}
 

@@ -240,6 +240,56 @@ EXPORT void obs_frontend_add_undo_redo_action(const char *name, const undo_redo_
 
 /* ------------------------------------------------------------------------- */
 
+
+// For SOOP Studio Frontend Event
+// 
+// After modifying the following content,
+// it is necessary to build the obs-studio-clone project first,
+// followed by building the SOOP Studio project.
+enum soop_frontend_type {
+	SOOP_FRONTEND_FIRST,
+
+	SOOP_FRONTEND_IMAGEPRINTER, // USE BALLOON IMAGE PRINTER
+	SOOP_FRONTED_LOG_SENDER,
+	SOOP_FRONTEND_SET_CEF_COOKIES,
+
+	SOOP_FRONTEND_EVENT_TOOGLE_MAIN_MIC_ON,
+	SOOP_FRONTEND_EVENT_TOOGLE_MAIN_MIC_OFF,
+	SOOP_FRONTEND_EVENT_TOOGLE_MAIN_VOLUME_ON,
+	SOOP_FRONTEND_EVENT_TOOGLE_MAIN_VOLUME_OFF,
+
+	SOOP_FRONTEND_EVENT_STATE_SIDEBAR_ON,
+	SOOP_FRONTEND_EVENT_STATE_SIDEBAR_OFF,
+
+	SOOP_FRONTEND_EVENT_STATE_LNBMENU_ON,
+	SOOP_FRONTEND_EVENT_STATE_LNBMENU_OFF,
+
+};
+
+typedef void (*soop_frontend_cb)(enum soop_frontend_type event, void* data,
+	void* private_data);
+
+EXPORT const char* soop_frontend_api_get_version(void);
+
+EXPORT void soop_frontend_add_callback(soop_frontend_cb callback,
+	void* private_data);
+EXPORT void soop_frontend_remove_callback(soop_frontend_cb callback,
+	void* private_data);
+
+EXPORT void soop_frontend_send_data(void* data);
+EXPORT void soop_frontend_toogle_main_mic(void);
+EXPORT void soop_frontend_toogle_main_vol(void);
+EXPORT bool soop_frontend_main_mic_state();
+EXPORT bool soop_frontend_main_vol_state();
+
+EXPORT void soop_frontend_toogle_channel_sidebar(void);
+EXPORT void soop_frontend_toogle_lnbmenu(int menuType);
+EXPORT bool soop_frontend_get_lnbmenu_state(int menuType);
+
+// use soop-imageprinter.dll
+EXPORT bool soop_frontend_add_imageprinter(const char* file, const char* path, int width, int height);
+
+
 #ifdef __cplusplus
 }
 #endif

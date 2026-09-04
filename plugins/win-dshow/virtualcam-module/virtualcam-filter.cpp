@@ -31,13 +31,8 @@ VCamFilter::VCamFilter() : OutputFilter()
 		file[0] = 0;
 	}
 
-#ifdef _WIN64
-	const wchar_t *obs_process = L"obs64.exe";
-#else
-	const wchar_t *obs_process = L"obs32.exe";
-#endif
-
-	in_obs = !!wcsstr(file, obs_process);
+	const wchar_t *obs_process = L"SoopStudio.exe";
+	in_soop = !!wcsstr(file, obs_process);
 
 	/* ---------------------------------------- */
 	/* add last/current obs res/interval        */
@@ -58,7 +53,7 @@ VCamFilter::VCamFilter() : OutputFilter()
 	} else {
 		wchar_t res_file[MAX_PATH];
 		SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, res_file);
-		StringCbCat(res_file, sizeof(res_file), L"\\obs-virtualcam.txt");
+		StringCbCat(res_file, sizeof(res_file), L"\\soop-virtualcam.txt");
 
 		HANDLE file = CreateFileW(res_file, GENERIC_READ, 0, nullptr, OPEN_EXISTING, 0, nullptr);
 		if (file) {
@@ -241,7 +236,7 @@ void VCamFilter::Frame(uint64_t ts)
 	if (new_obs_cx != obs_cx || new_obs_cy != obs_cy || new_obs_interval != obs_interval) {
 		/* The res / FPS of the video coming from OBS has
 		   changed, update parameters as needed */
-		if (in_obs) {
+		if (in_soop) {
 			/* If the vcam is being used inside obs, adjust
 			   the format we present to match */
 			SetVideoFormat(GetVideoFormat(), new_obs_cx, new_obs_cy, new_obs_interval);

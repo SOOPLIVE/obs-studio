@@ -24,7 +24,7 @@ static bool vcam_installed(bool b64)
 	wchar_t temp[MAX_PATH];
 	HKEY key = nullptr;
 
-	StringFromGUID2(CLSID_OBS_VirtualVideo, cls_str, CHARS_IN_GUID);
+	StringFromGUID2(CLSID_SOOP_VirtualVideo, cls_str, CHARS_IN_GUID);
 	StringCbPrintf(temp, sizeof(temp), L"CLSID\\%s", cls_str);
 
 	DWORD flags = KEY_READ;
@@ -45,9 +45,17 @@ bool obs_module_load(void)
 	RegisterDShowSource();
 	RegisterDShowEncoders();
 #ifdef VIRTUALCAM_AVAILABLE
-	if (vcam_installed(false))
-		obs_register_output(&virtualcam_info);
+	obs_register_output(&virtualcam_info);
+
+	bool installed = vcam_installed(true);
+#else
+	bool installed = false;
 #endif
+
+	obs_data_t *obs_settings = obs_data_create();
+	obs_data_set_bool(obs_settings, "vcamEnabled", installed);
+	obs_apply_private_data(obs_settings);
+	obs_data_release(obs_settings);
 
 	return true;
 }

@@ -36,9 +36,13 @@ using namespace DShow;
 
 /* settings defines that will cause errors if there are typos */
 #define VIDEO_DEVICE_ID   "video_device_id"
+#define USED_DEVICE	  "used_device"
+#define DEVICE_ALERT	  "device_alert"
 #define RES_TYPE          "res_type"
 #define RESOLUTION        "resolution"
 #define FRAME_INTERVAL    "frame_interval"
+#define LIMIT_FRAME	  "limit_frame"
+#define USE_LIMIT_FRAME   "use_limit_frame"
 #define VIDEO_FORMAT      "video_format"
 #define LAST_VIDEO_DEV_ID "last_video_device_id"
 #define LAST_RESOLUTION   "last_resolution"
@@ -62,6 +66,8 @@ using namespace DShow;
 #define TEXT_PREFERRED_RES  obs_module_text("ResFPSType.DevPreferred")
 #define TEXT_FPS_MATCHING   obs_module_text("FPS.Matching")
 #define TEXT_FPS_HIGHEST    obs_module_text("FPS.Highest")
+#define TEXT_FPS_LIMITED    obs_module_text("FPS.Limited")
+#define TEXT_USE_FPS_LIMITED    obs_module_text("FPS.Use.Limited")
 #define TEXT_RESOLUTION     obs_module_text("Resolution")
 #define TEXT_VIDEO_FORMAT   obs_module_text("VideoFormat")
 #define TEXT_FORMAT_UNKNOWN obs_module_text("VideoFormat.Unknown")
@@ -91,6 +97,9 @@ using namespace DShow;
 #define TEXT_RANGE_PARTIAL  obs_module_text("ColorRange.Partial")
 #define TEXT_RANGE_FULL     obs_module_text("ColorRange.Full")
 #define TEXT_DWNS           obs_module_text("DeactivateWhenNotShowing")
+
+#define MAKE_DSHOW_FPS(fps) (10000000LL / (fps))
+#define MAKE_DSHOW_FRACTIONAL_FPS(den, num) ((num)*10000000LL / (den))
 
 /* clang-format on */
 
@@ -192,6 +201,11 @@ struct DShowInput {
 	bool active = false;
 	bool autorotation = true;
 	bool hw_decode = false;
+	bool use_limitInterval = 0;
+	int  limitInterval = 0;
+	obs_source_frame2 limitFrame;
+
+	uint64_t lastLimitTS = 0;
 
 	Decoder audio_decoder;
 	Decoder video_decoder;
@@ -507,6 +521,7 @@ void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char *data, size
 #endif
 		obs_source_output_video2(source, &frame);
 	}
+
 }
 
 void DShowInput::OnReactivate()
@@ -602,7 +617,25 @@ void DShowInput::OnVideoData(const VideoConfig &config, unsigned char *data, siz
 		return;
 	}
 
-	obs_source_output_video2(source, &frame);
+	if (!use_limitInterval) {
+		obs_source_output_video2(source, &frame);
+		lastLimitTS = frame.timestamp;
+		return;
+	}
+
+	if (limitInterval <= videoConfig.frameInterval) {
+		obs_source_output_video2(source, &frame);
+		lastLimitTS = frame.timestamp;
+		return;
+	}
+
+	const int adjustLimitInterval = limitInterval * 100;
+	if (lastLimitTS == 0 ||
+		frame.timestamp - lastLimitTS >= adjustLimitInterval)
+	{
+		lastLimitTS = frame.timestamp;
+		obs_source_output_video2(source, &frame);
+	}
 
 	UNUSED_PARAMETER(endTime); /* it's the enndd tiimmes! */
 }
@@ -862,6 +895,8 @@ bool DShowInput::UpdateVideoConfig(obs_data_t *settings)
 	flip = obs_data_get_bool(settings, FLIP_IMAGE);
 	autorotation = obs_data_get_bool(settings, AUTOROTATION);
 	hw_decode = obs_data_get_bool(settings, HW_DECODE);
+	limitInterval = (int)obs_data_get_int(settings, LIMIT_FRAME);
+	use_limitInterval = obs_data_get_bool(settings, USE_LIMIT_FRAME);
 
 	DeviceId id;
 	if (!DecodeDeviceId(id, video_device_id.c_str())) {
@@ -1108,7 +1143,16 @@ inline bool DShowInput::Activate(obs_data_t *settings)
 	if (!device.ConnectFilters())
 		return false;
 
-	if (device.Start() != Result::Success)
+	Result result = device.Start();
+	//
+	bool used = (Result::InUse == result);
+	bool visibled = obs_data_get_bool(settings, USED_DEVICE);
+	if (used != visibled) {
+		obs_data_set_bool(settings, USED_DEVICE, used);
+		obs_source_update_properties(source);
+	}
+	//
+	if (result != Result::Success)
 		return false;
 
 	cs = GetColorSpace(settings);
@@ -1171,9 +1215,10 @@ static void *CreateDShowInput(obs_data_t *settings, obs_source_t *source)
 
 	try {
 		dshow = new DShowInput(source, settings);
-		proc_handler_t *ph = obs_source_get_proc_handler(source);
+		proc_handler_t* ph = obs_source_get_proc_handler(source);
 		proc_handler_add(ph, "void activate(bool active)", proc_activate, dshow);
-	} catch (const char *error) {
+	}
+	catch (const char* error) {
 		blog(LOG_ERROR, "Could not create device '%s': %s", obs_source_get_name(source), error);
 	}
 
@@ -1192,8 +1237,9 @@ static void UpdateDShowInput(void *data, obs_data_t *settings)
 		input->QueueActivate(settings);
 }
 
-static void GetDShowDefaults(obs_data_t *settings)
+static void GetDShowDefaults(obs_data_t* settings)
 {
+	obs_data_set_default_bool(settings, USED_DEVICE, false);
 	obs_data_set_default_int(settings, FRAME_INTERVAL, FPS_MATCHING);
 	obs_data_set_default_int(settings, RES_TYPE, ResType_Preferred);
 	obs_data_set_default_int(settings, VIDEO_FORMAT, (int)VideoFormat::Any);
@@ -1203,6 +1249,8 @@ static void GetDShowDefaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, AUDIO_OUTPUT_MODE, (int)AudioMode::Capture);
 	obs_data_set_default_bool(settings, AUTOROTATION, true);
 	obs_data_set_default_bool(settings, HW_DECODE, false);
+	obs_data_set_default_int(settings, LIMIT_FRAME, MAKE_DSHOW_FPS(10));
+	obs_data_set_default_bool(settings, USE_LIMIT_FRAME, false);
 }
 
 struct Resolution {
@@ -1240,9 +1288,6 @@ static inline void AddCap(vector<Resolution> &resolutions, const VideoInfo &cap)
 	InsertResolution(resolutions, cap.minCX, cap.minCY);
 	InsertResolution(resolutions, cap.maxCX, cap.maxCY);
 }
-
-#define MAKE_DSHOW_FPS(fps) (10000000LL / (fps))
-#define MAKE_DSHOW_FRACTIONAL_FPS(den, num) ((num) * 10000000LL / (den))
 
 static long long GetOBSFPS()
 {
@@ -1284,7 +1329,19 @@ static const FPSFormat validFPSFormats[] = {
 	{"1", MAKE_DSHOW_FPS(1)},
 };
 
-static bool DeviceIntervalChanged(obs_properties_t *props, obs_property_t *p, obs_data_t *settings);
+static const FPSFormat limitFPSFormats[] = {
+	{"60", MAKE_DSHOW_FPS(60)},
+	{"50", MAKE_DSHOW_FPS(50)},
+	{"40", MAKE_DSHOW_FPS(40)},
+	{"30", MAKE_DSHOW_FPS(30)},
+	{"25", MAKE_DSHOW_FPS(25)},
+	{"20", MAKE_DSHOW_FPS(20)},
+	{"15", MAKE_DSHOW_FPS(15)},
+	{"10", MAKE_DSHOW_FPS(10)},
+	{"5", MAKE_DSHOW_FPS(5)},
+};
+
+static bool DeviceIntervalChanged(obs_properties_t* props, obs_property_t* p, obs_data_t* settings);
 
 static bool TryResolution(const VideoDevice &dev, const string &res)
 {
@@ -1433,23 +1490,44 @@ static bool DeviceSelectionChanged(obs_properties_t *props, obs_property_t *p, o
 	p = obs_properties_get(props, RESOLUTION);
 	obs_property_list_clear(p);
 
+	bool findRes = false;
 	for (size_t idx = resolutions.size(); idx > 0; idx--) {
-		const Resolution &res = resolutions[idx - 1];
+		const Resolution& res = resolutions[idx - 1];
 
 		string strRes;
 		strRes += to_string(res.cx);
 		strRes += "x";
 		strRes += to_string(res.cy);
 
+		//if (device.exposure) {
+			if (res.cx == 1280 && res.cy == 720) {
+				findRes = true;
+			}
+		//}
+
 		obs_property_list_add_string(p, strRes.c_str(), strRes.c_str());
 	}
 
+	bool dev_changed = (id != old_id);
+	if (dev_changed)
+	{
+		if (findRes) {
+			string strRes = "1280x720";
+			obs_data_set_int(settings, RES_TYPE, ResType_Custom);
+			obs_data_set_string(settings, RESOLUTION, strRes.c_str());
+		} else {
+			obs_data_set_int(settings, RES_TYPE, ResType_Preferred);
+		}
+	}
+
 	/* only refresh properties if device legitimately changed */
-	if (!id.size() || !old_id.size() || id != old_id) {
+	if (!id.size() || !old_id.size() || dev_changed) {
 		p = obs_properties_get(props, RES_TYPE);
 		ResTypeChanged(props, p, settings);
 		obs_data_set_string(settings, LAST_VIDEO_DEV_ID, id.c_str());
 	}
+
+	//ResTypeChanged(props, p, settings);
 
 	return true;
 }
@@ -1625,6 +1703,51 @@ static void UpdateFPS(VideoDevice &device, VideoFormat format, long long interva
 	obs_property_list_item_disable(list, idx, true);
 }
 
+static void UpdateLimitFPS(obs_properties_t* props,
+	obs_data_t* settings, long long best_interval)
+{
+	obs_property_t* limit_prop =
+		obs_properties_get(props, LIMIT_FRAME);
+
+	obs_property_list_clear(limit_prop);
+
+	bool has_autosel_val =
+		obs_data_has_autoselect_value(settings, FRAME_INTERVAL);
+	long long selected_interval = has_autosel_val
+		? obs_data_get_autoselect_int(settings,
+			FRAME_INTERVAL)
+		: obs_data_get_int(settings, FRAME_INTERVAL);
+
+	if (selected_interval == FPS_MATCHING)
+		selected_interval = GetOBSFPS();
+
+	if (selected_interval == FPS_HIGHEST) {
+		selected_interval = best_interval;
+	}
+
+	if (selected_interval <= 0)
+		return;
+
+	for (const FPSFormat& fps : limitFPSFormats) {
+		if (fps.interval >= selected_interval) {
+			obs_property_list_add_int(
+				limit_prop,
+				fps.text,
+				fps.interval);
+		}
+	}
+
+	long long cur_limit_interval =
+		obs_data_get_int(settings, LIMIT_FRAME);
+
+	if (cur_limit_interval > 0 &&
+		cur_limit_interval < selected_interval)
+	{
+		obs_data_set_int(settings, LIMIT_FRAME,
+			selected_interval);
+	}
+}
+
 static DStr GetVideoFormatName(VideoFormat format)
 {
 	DStr name;
@@ -1703,7 +1826,17 @@ static bool UpdateFPS(long long interval, obs_property_t *list)
 	return true;
 }
 
-static bool DeviceIntervalChanged(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+static bool UseLimitedFPSChanged(obs_properties_t* props, obs_property_t*,
+	obs_data_t* settings)
+{
+	bool use = obs_data_get_bool(settings, USE_LIMIT_FRAME);
+	obs_property_t* limitedFPSList = obs_properties_get(props, LIMIT_FRAME);
+	obs_property_set_enabled(limitedFPSList, use);
+
+	return true;
+}
+
+static bool DeviceIntervalChanged(obs_properties_t* props, obs_property_t* p, obs_data_t* settings)
 {
 	long long val = obs_data_get_int(settings, FRAME_INTERVAL);
 
@@ -1757,6 +1890,8 @@ static bool DeviceIntervalChanged(obs_properties_t *props, obs_property_t *p, ob
 
 	UpdateVideoFormats(device, format, cx, cy, val, props);
 	UpdateFPS(device, format, val, cx, cy, props);
+
+	UpdateLimitFPS(props, settings, best_interval);
 
 	return true;
 }
@@ -1877,14 +2012,23 @@ static obs_properties_t *GetDShowProperties(void *obj)
 	obs_property_list_add_int(p, TEXT_PREFERRED_RES, ResType_Preferred);
 	obs_property_list_add_int(p, TEXT_CUSTOM_RES, ResType_Custom);
 
-	p = obs_properties_add_list(ppts, RESOLUTION, TEXT_RESOLUTION, OBS_COMBO_TYPE_EDITABLE,
-				    OBS_COMBO_FORMAT_STRING);
+	p = obs_properties_add_list(ppts, RESOLUTION, TEXT_RESOLUTION, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 
 	obs_property_set_modified_callback(p, DeviceResolutionChanged);
 
 	p = obs_properties_add_list(ppts, FRAME_INTERVAL, "FPS", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 
 	obs_property_set_modified_callback(p, DeviceIntervalChanged);
+
+	//p = obs_properties_add_bool(ppts, USE_LIMIT_FRAME, TEXT_USE_FPS_LIMITED);
+	//obs_property_set_modified_callback(p, UseLimitedFPSChanged);
+	//obs_property_set_visible(p, false);
+
+	//p = obs_properties_add_list(ppts, LIMIT_FRAME, TEXT_FPS_LIMITED, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	//for (const FPSFormat& fps_format : limitFPSFormats) {
+	//	obs_property_list_add_int(p, fps_format.text, fps_format.interval);
+	//}
+	//obs_property_set_visible(p, false);
 
 	p = obs_properties_add_list(ppts, VIDEO_FORMAT, TEXT_VIDEO_FORMAT, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 

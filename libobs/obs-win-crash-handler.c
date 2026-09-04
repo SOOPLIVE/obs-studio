@@ -249,6 +249,30 @@ static inline void write_header(struct exception_handler_data *data)
 
 	const char *release_id = get_win_release_id();
 
+	char dst[512];
+	int broadnum = 0;
+	char broad_id[64] = {0,};
+	int found = os_get_config_path(dst, 512, "SOOPStudio");
+	if (found != -1) {
+		char file_path[512];
+		snprintf(file_path, sizeof(file_path), "%s\\broad_info", dst);
+		FILE *fp = fopen(file_path, "r");
+		if (fp) {
+			char line_buffer[128];
+			if (fgets(line_buffer, sizeof(line_buffer), fp)) {
+				char *delimiter = strchr(line_buffer, '|');
+				if (delimiter) {
+					*delimiter = '\0';
+					strncpy(broad_id, line_buffer, sizeof(broad_id) - 1);
+					broad_id[sizeof(broad_id) - 1] = '\0';
+					broadnum = atoi(delimiter + 1);
+				}
+			}
+			fclose(fp);
+			os_unlink(file_path);
+		}
+	}
+	
 	dstr_catf(&data->str,
 		  "Unhandled exception: %x\r\n"
 		  "Date/Time: %s\r\n"
@@ -256,11 +280,15 @@ static inline void write_header(struct exception_handler_data *data)
 		  "libobs version: " OBS_VERSION " (%s-bit)\r\n"
 		  "Windows version: %d.%d build %d (release: %s; revision: %d; "
 		  "%s-bit)\r\n"
-		  "CPU: %s\r\n\r\n",
-		  data->exception->ExceptionRecord->ExceptionCode, date_time, data->main_trace.instruction_ptr,
-		  data->module_name.array, obs_bitness, data->win_version.major, data->win_version.minor,
-		  data->win_version.build, release_id, data->win_version.revis, is_64_bit_windows() ? "64" : "32",
-		  data->cpu_info.array);
+		  "CPU: %s\r\n"
+		  "ID: %s\r\n"
+		  "Broad Number: %d\r\n\r\n",
+		  data->exception->ExceptionRecord->ExceptionCode, date_time,
+		  data->main_trace.instruction_ptr, data->module_name.array,
+		  obs_bitness, data->win_version.major, data->win_version.minor,
+		  data->win_version.build, release_id, data->win_version.revis,
+		  is_64_bit_windows() ? "64" : "32", data->cpu_info.array,
+		  broad_id, broadnum);
 }
 
 struct module_info {
@@ -420,6 +448,11 @@ static inline void write_thread_trace(struct exception_handler_data *data, THREA
 	init_instruction_data(&trace);
 
 	thread_name = get_thread_name(thread);
+	if (!thread_name && !crash_thread) {
+		bfree(thread_name);
+		CloseHandle(thread);
+		return;
+	}
 
 	dstr_catf(&data->str, "\r\nThread %lX:%s%s\r\n" TRACE_TOP, entry->th32ThreadID, thread_name ? thread_name : "",
 		  crash_thread ? " (Crashed)" : "");

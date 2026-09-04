@@ -44,6 +44,8 @@ extern struct obs_encoder_info hevc_nvenc_encoder_info;
 extern struct obs_encoder_info svt_av1_encoder_info;
 extern struct obs_encoder_info aom_av1_encoder_info;
 
+extern struct obs_source_info ffmpeg_list_source;
+
 #ifdef LIBAVUTIL_VAAPI_AVAILABLE
 extern struct obs_encoder_info h264_vaapi_encoder_info;
 extern struct obs_encoder_info h264_vaapi_encoder_tex_info;
@@ -340,6 +342,8 @@ static void register_encoder_if_available(struct obs_encoder_info *info, const c
 	}
 }
 
+extern void init_soop_vod_source_info(struct obs_source_info* source, const char* id);
+
 bool obs_module_load(void)
 {
 	obs_register_source(&ffmpeg_source);
@@ -357,6 +361,9 @@ bool obs_module_load(void)
 	obs_register_encoder(&pcm32_encoder_info);
 	obs_register_encoder(&alac_encoder_info);
 	obs_register_encoder(&flac_encoder_info);
+
+	obs_register_source(&ffmpeg_list_source);
+
 #ifdef ENABLE_FFMPEG_NVENC
 	bool h264 = false;
 	bool hevc = false;

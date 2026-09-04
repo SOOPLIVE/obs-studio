@@ -61,7 +61,19 @@ static inline void mix_audio(struct audio_output_data *mixes, obs_source_t *sour
 
 		total_floats -= start_point;
 	}
+#pragma region _SOOP_MASTER_AUDIO
+	float mul = (float)0;
 
+	if ((source->soop_main_view_channel > 2) &&
+	    (source->soop_main_view_channel <
+	     7)) { // 전역 입력 (마이크/Aux 오디오, 마이크/Aux 오디오 2, 마이크/Aux 오디오 3 및 마이크/Aux 오디오 4)
+		if (obs->audio.soop_master_input_muted == false)
+			mul = obs->audio.soop_master_input_volume;
+	} else { // 전역 입력이 아님 (현재 장면, 데스크탑 오디오, 데스크탑 오디오 2 및 기타)
+		if (obs->audio.soop_master_output_muted == false)
+			mul = obs->audio.soop_master_output_volume;
+	}
+#pragma endregion
 	for (size_t mix_idx = 0; mix_idx < MAX_AUDIO_MIXES; mix_idx++) {
 		for (size_t ch = 0; ch < channels; ch++) {
 			register float *mix = mixes[mix_idx].data[ch];
@@ -72,7 +84,11 @@ static inline void mix_audio(struct audio_output_data *mixes, obs_source_t *sour
 			end = aud + total_floats;
 
 			while (aud < end)
-				*(mix++) += *(aud++);
+				*(mix++) += *(aud++)
+#pragma region _SOOP_VLC
+				* mul
+#pragma endregion
+				;
 		}
 	}
 }
@@ -587,6 +603,15 @@ bool audio_callback(void *param, uint64_t start_ts_in, uint64_t end_ts_in, uint6
 			if (source->audio_pending)
 				continue;
 
+#pragma region _SOOP_OUTPUT_SOURCE_EXCLUSIVE_AUDIO
+			if (obs->audio
+				    .soop_output_source_exclusive_audio_channel >
+			    -1) // 오디오 독점
+				if (source->soop_main_view_channel !=
+				    obs->audio
+					    .soop_output_source_exclusive_audio_channel) // 독점 대상 아님
+					continue; // 믹싱 안함
+#pragma endregion
 			pthread_mutex_lock(&source->audio_buf_mutex);
 
 			if (source->audio_output_buf[0][0] && source->audio_ts)

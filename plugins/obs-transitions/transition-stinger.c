@@ -126,7 +126,6 @@ static void stinger_update(void *data, obs_data_t *settings)
 	}
 
 	s->monitoring_type = (int)obs_data_get_int(settings, "audio_monitoring");
-	obs_source_set_monitoring_type(s->media_source, s->monitoring_type);
 
 	s->fade_style = (enum fade_style)obs_data_get_int(settings, "audio_fade_style");
 

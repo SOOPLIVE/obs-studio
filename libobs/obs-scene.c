@@ -1990,6 +1990,14 @@ obs_scene_t *obs_scene_duplicate(obs_scene_t *scene, const char *name, enum obs_
 	new_scene = make_private ? create_private_id(scene->source->info.id, name)
 				 : create_id(scene->source->info.id, name);
 
+	new_scene->is_group = scene->is_group;
+	new_scene->custom_size = scene->custom_size;
+	new_scene->cx = scene->cx;
+	new_scene->cy = scene->cy;
+	new_scene->absolute_coordinates = scene->absolute_coordinates;
+	new_scene->last_width = scene->last_width;
+	new_scene->last_height = scene->last_height;
+
 	obs_source_copy_filters(new_scene->source, scene->source);
 
 	obs_data_apply(new_scene->source->private_settings, scene->source->private_settings);
@@ -2861,7 +2869,6 @@ void obs_sceneitem_set_order_position(obs_sceneitem_t *item, int position)
 		return;
 
 	struct obs_scene *scene = obs_scene_get_ref(item->parent);
-	struct obs_scene_item *next;
 
 	if (!scene)
 		return;
@@ -2869,11 +2876,12 @@ void obs_sceneitem_set_order_position(obs_sceneitem_t *item, int position)
 	full_lock(scene);
 
 	detach_sceneitem(item);
-	next = scene->first_item;
 
-	if (position == 0) {
+	if (!scene->first_item || position == 0) {
 		attach_sceneitem(scene, item, NULL);
 	} else {
+		struct obs_scene_item *next = scene->first_item;
+
 		for (int i = position; i > 1; --i) {
 			if (next->next == NULL)
 				break;

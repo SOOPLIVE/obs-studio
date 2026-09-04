@@ -878,6 +878,24 @@ static obs_properties_t *ss_properties(void *data)
 
 	/* ----------------- */
 
+	if (ss) {
+		pthread_mutex_lock(&ss->mutex);
+		if (ss->files.num) {
+			struct image_file_data* last = da_end(ss->files);
+			const char* slash;
+
+			dstr_copy(&path, last->path);
+			dstr_replace(&path, "\\", "/");
+			slash = strrchr(path.array, '/');
+			if (slash)
+				dstr_resize(&path, slash - path.array + 1);
+		}
+		pthread_mutex_unlock(&ss->mutex);
+	}
+
+	obs_properties_add_editable_list(ppts, S_FILES, T_FILES, OBS_EDITABLE_LIST_TYPE_FILES, file_filter, path.array);
+	dstr_free(&path);
+
 	p = obs_properties_add_list(ppts, S_BEHAVIOR, T_BEHAVIOR, OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(p, T_BEHAVIOR_ALWAYS_PLAY, S_BEHAVIOR_ALWAYS_PLAY);
 	obs_property_list_add_string(p, T_BEHAVIOR_STOP_RESTART, S_BEHAVIOR_STOP_RESTART);
@@ -914,24 +932,6 @@ static obs_properties_t *ss_properties(void *data)
 	char str[32];
 	snprintf(str, sizeof(str), "%dx%d", cx, cy);
 	obs_property_list_add_string(p, str, str);
-
-	if (ss) {
-		pthread_mutex_lock(&ss->mutex);
-		if (ss->files.num) {
-			struct image_file_data *last = da_end(ss->files);
-			const char *slash;
-
-			dstr_copy(&path, last->path);
-			dstr_replace(&path, "\\", "/");
-			slash = strrchr(path.array, '/');
-			if (slash)
-				dstr_resize(&path, slash - path.array + 1);
-		}
-		pthread_mutex_unlock(&ss->mutex);
-	}
-
-	obs_properties_add_editable_list(ppts, S_FILES, T_FILES, OBS_EDITABLE_LIST_TYPE_FILES, file_filter, path.array);
-	dstr_free(&path);
 
 	return ppts;
 }

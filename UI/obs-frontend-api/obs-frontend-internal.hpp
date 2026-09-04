@@ -139,4 +139,28 @@ struct obs_frontend_callbacks {
 						       const char *redo_data, bool repeatable) = 0;
 };
 
+struct soop_frontend_callbacks : obs_frontend_callbacks {
+
+	virtual void soop_frontend_add_callback(soop_frontend_cb callback,
+		void* private_data) = 0;
+
+	virtual void soop_frontend_remove_callback(soop_frontend_cb callback,
+		void* private_data) = 0;
+
+	virtual void soop_frontend_send_data(void* data) = 0;
+	virtual void soop_frontend_toogle_main_mic() = 0;
+	virtual void soop_frontend_toogle_main_vol() = 0;
+	virtual bool soop_frontend_main_mic_state() = 0;
+	virtual bool soop_frontend_main_vol_state() = 0;
+
+	virtual void soop_frontend_toogle_channel_sidebar() = 0;
+	virtual void soop_frontend_toogle_lnbmenu(int menuType) = 0;
+	virtual bool soop_frontend_get_lnbmenu_state(int menuType) = 0;
+
+	virtual bool soop_frontend_add_imageprinter(const char* file, const char* path, int width, int height) = 0;
+
+	virtual void on_soop_event(enum soop_frontend_type frontend_type, void*) = 0;
+};
+
 EXPORT void obs_frontend_set_callbacks_internal(obs_frontend_callbacks *callbacks);
+EXPORT void soop_frontend_set_callbacks_internal(soop_frontend_callbacks* callbacks);

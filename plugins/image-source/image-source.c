@@ -72,6 +72,13 @@ static void image_source_load_texture(void *data)
 		warn("failed to load texture '%s'", context->file);
 	context->update_time_elapsed = 0;
 	os_atomic_set_bool(&context->texture_loaded, true);
+
+	if (context->if4.image3.image2.image.loaded) {
+		int w = context->if4.image3.image2.image.cx;
+		int h = context->if4.image3.image2.image.cy;
+		obs_source_media_file_load(context->source, w, h);
+	}
+
 }
 
 static void image_source_unload(void *data)

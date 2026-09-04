@@ -38,10 +38,10 @@ static void nvenc_defaults_base(enum codec_type codec, obs_data_t *settings)
 {
 	struct encoder_caps *caps = get_encoder_caps(codec);
 
-	obs_data_set_default_int(settings, "bitrate", 10000);
+	obs_data_set_default_int(settings, "bitrate", 2000);
 	obs_data_set_default_int(settings, "max_bitrate", 10000);
 	obs_data_set_default_int(settings, "target_quality", 20);
-	obs_data_set_default_int(settings, "keyint_sec", 0);
+	obs_data_set_default_int(settings, "keyint_sec", 2);
 	obs_data_set_default_int(settings, "cqp", 20);
 	obs_data_set_default_int(settings, "device", -1);
 	obs_data_set_default_int(settings, "bf", caps->bframes > 0 ? 2 : 0);

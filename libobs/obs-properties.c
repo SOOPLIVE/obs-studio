@@ -77,6 +77,21 @@ struct button_data {
 	obs_property_clicked_t callback;
 	enum obs_button_type type;
 	char *url;
+
+	//
+	char *image_path;
+	int width;
+	int height;
+};
+
+struct image_button_group_item_data {
+	obs_property_clicked_t callback;
+	char* image_path;
+	char* group_name;
+
+	int idx;
+	int width;
+	int height;
 };
 
 struct frame_rate_option {
@@ -97,6 +112,11 @@ struct frame_rate_data {
 struct group_data {
 	enum obs_group_type type;
 	obs_properties_t *content;
+};
+
+struct image_button_group_data {
+	obs_properties_t* content;
+	int columns;
 };
 
 static inline void path_data_free(struct path_data *data)
@@ -175,12 +195,27 @@ static inline void button_data_free(struct button_data *data)
 		bfree(data->url);
 }
 
+static inline void image_button_group_item_data_free(struct image_button_group_item_data* data)
+{
+	if (data->image_path)
+		bfree(data->image_path);
+
+	if (data->group_name)
+		bfree(data->group_name);
+}
+
+static inline void image_button_group_data_free(struct image_button_group_data* data)
+{
+	obs_properties_destroy(data->content);
+}
+
 struct obs_properties;
 
 struct obs_property {
 	char *name;
 	char *desc;
 	char *long_desc;
+	char* label_text;
 	void *priv;
 	enum obs_property_type type;
 	bool visible;
@@ -264,6 +299,10 @@ static void obs_property_destroy(struct obs_property *property)
 		float_data_free(get_property_data(property));
 	else if (property->type == OBS_PROPERTY_BUTTON)
 		button_data_free(get_property_data(property));
+	else if (property->type == OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM)
+		image_button_group_item_data_free(get_property_data(property));
+	else if (property->type == OBS_PROPERTY_IMAGE_BUTTON_GROUP)
+		image_button_group_data_free(get_property_data(property));
 
 	bfree(property->name);
 	bfree(property->desc);
@@ -428,6 +467,10 @@ static inline size_t get_property_size(enum obs_property_type type)
 		return sizeof(struct group_data);
 	case OBS_PROPERTY_COLOR_ALPHA:
 		return 0;
+	case OBS_PROPERTY_IMAGE_BUTTON_GROUP:
+		return sizeof(struct image_button_group_data);
+	case OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM:
+		return sizeof(struct image_button_group_item_data);
 	}
 
 	return 0;
@@ -861,6 +904,15 @@ void obs_property_set_long_description(obs_property_t *p, const char *long_desc)
 	}
 }
 
+void obs_property_set_label_text(obs_property_t* p, const char* label_text)
+{
+	if (p) {
+		bfree(p->label_text);
+		p->label_text = label_text && *label_text ? bstrdup(label_text)
+			: NULL;
+	}
+}
+
 const char *obs_property_name(obs_property_t *p)
 {
 	return p ? p->name : NULL;
@@ -874,6 +926,11 @@ const char *obs_property_description(obs_property_t *p)
 const char *obs_property_long_description(obs_property_t *p)
 {
 	return p ? p->long_desc : NULL;
+}
+
+EXPORT const char* obs_property_label_text(obs_property_t* p)
+{
+	return p ? p->label_text : NULL;
 }
 
 enum obs_property_type obs_property_get_type(obs_property_t *p)
@@ -1412,4 +1469,118 @@ const char *obs_property_button_url(obs_property_t *p)
 {
 	struct button_data *data = get_type_data(p, OBS_PROPERTY_BUTTON);
 	return data ? data->url : "";
+}
+
+const char* fs_property_image_button_group_item_path(obs_property_t* p)
+{
+	struct image_button_group_item_data* data = get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM);
+	return data ? data->image_path : "";
+}
+
+const char* fs_property_image_button_group_item_groupname(obs_property_t* p)
+{
+	struct image_button_group_item_data* data = get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM);
+	return data ? data->group_name : "";
+}
+
+int fs_property_image_button_group_item_width(obs_property_t* p)
+{
+	struct image_button_group_item_data* data = get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM);
+	return data ? data->width : 0;
+}
+
+int fs_property_image_button_group_item_height(obs_property_t* p)
+{
+	struct image_button_group_item_data* data = get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM);
+	return data ? data->height : 0;
+}
+
+int fs_property_image_button_group_item_idx(obs_property_t* p)
+{
+	struct image_button_group_item_data* data = get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM);
+	return data ? data->idx : 0;
+}
+
+obs_properties_t* fs_property_image_button_group_content(obs_property_t* p)
+{
+	struct image_button_group_data* data = get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP);
+	return data ? data->content : NULL;
+}
+
+int fs_property_image_button_group_columns(obs_property_t* p)
+{
+	struct image_button_group_data* data = get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP);
+	return data ? data->columns : 0;
+}
+
+obs_property_t* fs_properties_add_image_button_group_item(obs_properties_t* props,
+					const char* name, const char* desc,
+					const char* group_name, const char* path,
+					int width, int height, int idx,
+					obs_property_clicked_t callback)
+{
+	if (!props || has_prop(props, name))
+		return NULL;
+
+	struct obs_property* p =
+		new_prop(props, name, desc, OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM);
+	struct image_button_group_item_data* data = get_property_data(p);
+	data->callback = callback;
+	data->image_path = bstrdup(path);
+	data->group_name = bstrdup(path);
+
+	data->idx = idx;
+	data->width = width;
+	data->height = height;
+	return p;
+}
+
+
+obs_property_t*
+fs_properties_add_image_button_group(obs_properties_t* props,
+			const char* name, const char* desc, int columns,
+			obs_properties_t* group)
+{
+	if (!props || has_prop(props, name))
+		return NULL;
+	if (!group)
+		return NULL;
+
+	/* Prevent recursion. */
+	if (props == group)
+		return NULL;
+	if (check_property_group_recursion(props, group))
+		return NULL;
+
+	/* Prevent duplicate properties */
+	if (check_property_group_duplicates(props, group))
+		return NULL;
+
+	obs_property_t* p = new_prop(props, name, desc, OBS_PROPERTY_IMAGE_BUTTON_GROUP);
+	props->groups++;
+	group->parent = p;
+
+	struct image_button_group_data* data = get_property_data(p);
+	//data->type = type;
+	data->content = group;
+	data->columns = columns;
+	return p;
+}
+
+bool fs_property_image_button_group_item_clicked(obs_property_t* p, void* obj)
+{
+	struct obs_context_data* context = obj;
+	if (p) {
+		struct image_button_group_item_data* data =
+			get_type_data(p, OBS_PROPERTY_IMAGE_BUTTON_GROUP_ITEM);
+		if (data && data->callback) {
+			obs_properties_t* top = get_topmost_parent(p->parent);
+			if (p->priv)
+				return data->callback(top, p, p->priv);
+			return data->callback(top, p,
+				(context ? context->data : NULL));
+		}
+	}
+
+	return false;
 }

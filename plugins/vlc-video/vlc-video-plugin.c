@@ -153,6 +153,11 @@ static bool load_vlc_funcs(void)
 static bool load_libvlc_module(void)
 {
 #ifdef _WIN32
+#pragma region _SOOP_VLC
+	libvlc_module = os_dlopen("..\\..\\obs-plugins\\64bit\\vlc\\libvlc.dll");
+	if (libvlc_module != NULL)
+		return true;
+#pragma endregion
 	char *path_utf8 = NULL;
 	wchar_t path[1024];
 	LSTATUS status;
@@ -198,6 +203,14 @@ static bool load_libvlc_module(void)
 }
 
 extern struct obs_source_info vlc_source_info;
+#pragma region _SOOP_VLC
+extern struct obs_source_info soop_anivod_source;
+extern struct obs_source_info soop_sportvod_source;
+extern struct obs_source_info soop_dramavod_source;
+extern struct obs_source_info soop_movievod_source;
+extern struct obs_source_info soop_directbroad_source;
+extern struct obs_source_info soop_tv_cable_source;
+#pragma endregion
 
 bool load_libvlc(void)
 {
@@ -228,6 +241,14 @@ bool obs_module_load(void)
 	blog(LOG_INFO, "[vlc-video]: VLC %s found, VLC video source enabled", libvlc_get_version_());
 
 	obs_register_source(&vlc_source_info);
+#pragma region _SOOP_VLC
+	obs_register_source(&soop_anivod_source);
+	obs_register_source(&soop_sportvod_source);
+	obs_register_source(&soop_dramavod_source);
+	obs_register_source(&soop_movievod_source);
+	obs_register_source(&soop_directbroad_source);
+	obs_register_source(&soop_tv_cable_source);
+#pragma endregion
 	return true;
 }
 

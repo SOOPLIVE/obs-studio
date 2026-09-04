@@ -2195,14 +2195,14 @@ void OBSBasic::OBSInit()
 			disableSaving++;
 		}
 
-		disableSaving--;
 		if (foundCollection || configuredCollection) {
+			disableSaving--;
 			OnEvent(OBS_FRONTEND_EVENT_SCENE_COLLECTION_LIST_CHANGED);
 			OnEvent(OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED);
+			OnEvent(OBS_FRONTEND_EVENT_SCENE_CHANGED);
+			OnEvent(OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED);
+			disableSaving++;
 		}
-		OnEvent(OBS_FRONTEND_EVENT_SCENE_CHANGED);
-		OnEvent(OBS_FRONTEND_EVENT_PREVIEW_SCENE_CHANGED);
-		disableSaving++;
 	}
 
 	loaded = true;
@@ -9552,6 +9552,7 @@ QAction *OBSBasic::AddDockWidget(QDockWidget *dock)
 	QAction *action = ui->menuDocks->addAction(dock->windowTitle());
 #endif
 	action->setCheckable(true);
+	action->setMenuRole(QAction::NoRole);
 	assignDockToggle(dock, action);
 	oldExtraDocks.push_back(dock);
 	oldExtraDockNames.push_back(dock->objectName());

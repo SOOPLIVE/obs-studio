@@ -9,6 +9,9 @@
 #include <util/c99defs.h>
 #include <util/base.h>
 
+
+#define HOOK_UPDATE_PATH	L"soop-studio-hook\\"
+
 /* ------------------------------------------------------------------------- */
 /* helper funcs                                                              */
 
@@ -141,6 +144,7 @@ static LSTATUS get_reg(HKEY hkey, LPCWSTR sub_key, LPCWSTR value_name, bool b64)
 		StringCbCatW(str, sizeof(str), ext);                 \
 	} while (false)
 
+
 /* ------------------------------------------------------------------------- */
 /* function to get the path to the hook                                      */
 
@@ -151,8 +155,9 @@ char *get_hook_path(bool b64)
 {
 	wchar_t path[MAX_PATH];
 
-	get_programdata_path(path, L"obs-studio-hook\\");
-	make_filename(path, L"graphics-hook", L".dll");
+	get_programdata_path(path, HOOK_UPDATE_PATH);
+	StringCbCatW(path, sizeof(path),
+		     b64 ? L"graphics-hook64.dll" : L"graphics-hook32.dll");
 
 	if ((b64 && programdata64_hook_exists) || (!b64 && programdata32_hook_exists)) {
 		char *path_utf8 = NULL;
@@ -257,7 +262,7 @@ static void init_vulkan_registry(bool b64)
 	LSTATUS s;
 
 	wchar_t path[MAX_PATH];
-	get_programdata_path(path, L"obs-studio-hook\\");
+	get_programdata_path(path, HOOK_UPDATE_PATH);
 	make_filename(path, L"obs-vulkan", L".json");
 
 	s = get_reg(HKEY_LOCAL_MACHINE, IMPLICIT_LAYERS, path, b64);

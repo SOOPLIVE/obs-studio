@@ -11,6 +11,7 @@
 #include <util/util_uint64.h>
 #include <ipc-util/pipe.h>
 #include <util/windows/obfuscate.h>
+#include <jansson.h>
 #include "inject-library.h"
 #include "compat-helpers.h"
 #include "graphics-hook-info.h"
@@ -42,6 +43,7 @@
 #define SETTING_HOOK_RATE            "hook_rate"
 #define SETTING_RGBA10A2_SPACE       "rgb10a2_space"
 #define SETTINGS_COMPAT_INFO         "compat_info"
+#define SETTING_EXCEPTION_PROC	     "exception_proc"
 
 /* deprecated */
 #define SETTING_ANY_FULLSCREEN   "capture_any_fullscreen"
@@ -84,6 +86,8 @@
 #define TEXT_HOTKEY_START        obs_module_text("GameCapture.HotkeyStart")
 #define TEXT_HOTKEY_STOP         obs_module_text("GameCapture.HotkeyStop")
 
+#define TEXT_WARNING_ADMIN      obs_module_text("Compatibility.GameCapture.Admin")
+
 /* clang-format on */
 
 #define DEFAULT_RETRY_INTERVAL 2.0f
@@ -109,6 +113,7 @@ struct game_capture_config {
 	bool limit_framerate;
 	bool capture_overlays;
 	bool anticheat_hook;
+	bool exception_proc;
 	enum hook_rate hook_rate;
 	bool is_10a2_2100pq;
 	bool capture_audio;
@@ -443,6 +448,7 @@ static inline void get_config(struct game_capture_config *cfg, obs_data_t *setti
 	cfg->limit_framerate = obs_data_get_bool(settings, SETTING_LIMIT_FRAMERATE);
 	cfg->capture_overlays = obs_data_get_bool(settings, SETTING_CAPTURE_OVERLAYS);
 	cfg->anticheat_hook = obs_data_get_bool(settings, SETTING_ANTI_CHEAT_HOOK);
+	cfg->exception_proc = obs_data_get_bool(settings, SETTING_EXCEPTION_PROC);
 	cfg->hook_rate = (enum hook_rate)obs_data_get_int(settings, SETTING_HOOK_RATE);
 	cfg->is_10a2_2100pq = strcmp(obs_data_get_string(settings, SETTING_RGBA10A2_SPACE), "2100pq") == 0;
 	cfg->capture_audio = obs_data_get_bool(settings, SETTING_CAPTURE_AUDIO);
@@ -915,17 +921,15 @@ static inline bool inject_hook(struct game_capture *gc)
 {
 	bool matching_architecture;
 	bool success = false;
-	char *inject_path;
-	char *hook_path;
+	char *inject_path = NULL;
+	char *hook_path = NULL;
 
 	if (gc->process_is_64bit) {
 		inject_path = obs_module_file("inject-helper64.exe");
 	} else {
 		inject_path = obs_module_file("inject-helper32.exe");
 	}
-
 	hook_path = get_hook_path(gc->process_is_64bit);
-
 	if (!check_file_integrity(gc, inject_path, "inject helper")) {
 		goto cleanup;
 	}
@@ -2088,10 +2092,10 @@ static const char *game_capture_name(void *unused)
 	UNUSED_PARAMETER(unused);
 	return TEXT_GAME_CAPTURE;
 }
-
+//
 static void game_capture_defaults(obs_data_t *settings)
 {
-	obs_data_set_default_string(settings, SETTING_MODE, SETTING_MODE_ANY);
+	obs_data_set_default_string(settings, SETTING_MODE, SETTING_MODE_WINDOW);
 	obs_data_set_default_int(settings, SETTING_WINDOW_PRIORITY, (int)WINDOW_PRIORITY_EXE);
 	obs_data_set_default_bool(settings, SETTING_COMPATIBILITY, false);
 	obs_data_set_default_bool(settings, SETTING_CURSOR, true);
@@ -2100,6 +2104,7 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, SETTING_LIMIT_FRAMERATE, false);
 	obs_data_set_default_bool(settings, SETTING_CAPTURE_OVERLAYS, false);
 	obs_data_set_default_bool(settings, SETTING_ANTI_CHEAT_HOOK, true);
+	obs_data_set_default_bool(settings, SETTING_EXCEPTION_PROC, false);
 	obs_data_set_default_int(settings, SETTING_HOOK_RATE, (int)HOOK_RATE_NORMAL);
 	obs_data_set_default_string(settings, SETTING_RGBA10A2_SPACE, RGBA10A2_SPACE_SRGB);
 }
@@ -2146,17 +2151,45 @@ static bool window_changed_callback(obs_properties_t *ppts, obs_property_t *p, o
 	char *title;
 	ms_build_window_strings(window, &class, &title, &exe);
 	struct compat_result *compat = check_compatibility(title, class, exe, GAME_CAPTURE);
-	bfree(title);
-	bfree(exe);
-	bfree(class);
 
 	obs_property_t *p_warn = obs_properties_get(ppts, SETTINGS_COMPAT_INFO);
 
 	if (!compat) {
+		HWND target_hwnd = ms_find_window(EXCLUDE_MINIMIZED, WINDOW_PRIORITY_EXE,
+			class, title, exe);
+		if (target_hwnd) {
+			DWORD pid;
+
+			GetWindowThreadProcessId(target_hwnd, &pid);
+
+			bool show_admin_tag = is_process_elevated(pid) &&
+					      !is_obs_elevated();
+			if (show_admin_tag) {
+				struct dstr warn_msg = {0};
+				dstr_copy(&warn_msg, TEXT_WARNING_ADMIN);
+				dstr_replace(&warn_msg, "%name%", title ? title : exe);
+				obs_property_set_long_description(
+					p_warn, warn_msg.array);
+				obs_property_text_set_info_type(p_warn, OBS_TEXT_INFO_WARNING);
+				obs_property_set_visible(p_warn, true);
+
+				bfree(title);
+				bfree(exe);
+				bfree(class);
+				return true;
+			}
+		}
+		bfree(title);
+		bfree(exe);
+		bfree(class);
+
 		modified = obs_property_visible(p_warn) || modified;
 		obs_property_set_visible(p_warn, false);
 		return modified;
 	}
+	bfree(title);
+	bfree(exe);
+	bfree(class);
 
 	obs_property_set_long_description(p_warn, compat->message);
 	obs_property_text_set_info_type(p_warn, compat->severity);
@@ -2229,7 +2262,7 @@ static obs_properties_t *game_capture_properties(void *data)
 
 	p = obs_properties_add_list(ppts, SETTING_CAPTURE_WINDOW, TEXT_WINDOW, OBS_COMBO_TYPE_LIST,
 				    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(p, "", "");
+	//obs_property_list_add_string(p, "", "");
 	ms_fill_window_list(p, INCLUDE_MINIMIZED, window_not_blacklisted);
 
 	obs_property_set_modified_callback(p, window_changed_callback);

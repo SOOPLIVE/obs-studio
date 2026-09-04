@@ -86,6 +86,16 @@ public:
 	OBSImporterFiles FindFiles();
 };
 
+class FreecShotImporter : public Importer {
+public:
+	std::string Prog() { return "FreecShot"; };
+	int ImportScenes(const std::string &path, std::string &name,
+			 json11::Json &res);
+	bool Check(const std::string &path);
+	std::string Name(const std::string &) { return "FreecShot Import"; };
+	OBSImporterFiles FindFiles();
+};
+
 void ImportersInit();
 
 std::string DetectProgram(const std::string &path);

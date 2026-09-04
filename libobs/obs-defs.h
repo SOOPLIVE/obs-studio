@@ -19,6 +19,12 @@
 
 /** Maximum number of source channels for output and per display */
 #define MAX_CHANNELS 64
+#pragma region _SOOP_SOURCE_CHANNELS
+// obs_set_output_source
+// 0 : Scene Transition, 1 : Desktop Audio, 2 : Desktop Audio 2,
+// 3 : Mic/Aux Audio, 4 : Mic/Aux Audio 2, 5 : Mic/Aux Audio 3, 6 : Mic/Aux Audio 4,
+// MAX_CHANNELS - 1 : Breaktime Video, MAX_CHANNELS - 2 : Breaktime Audio
+#pragma endregion
 
 #define OBS_ALIGN_CENTER (0)
 #define OBS_ALIGN_LEFT (1 << 0)

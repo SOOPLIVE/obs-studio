@@ -89,12 +89,29 @@ static DXGI_FORMAT get_pixel_format(HWND window, HMONITOR monitor, BOOL force_sd
 	return (monitor && gs_is_monitor_hdr(monitor)) ? DXGI_FORMAT_R16G16B16A16_FLOAT : sdr_format;
 }
 
+static inline D3D11_BOX RECT_to_D3D11_BOX(const RECT *rect_ptr)
+{
+	D3D11_BOX box = {0, 0, 0, 0, 0, 0}; // Zero initialize
+	if (rect_ptr) {
+		box.left = (UINT)rect_ptr->left;
+		box.top = (UINT)rect_ptr->top;
+		box.front = 0;
+		box.right = (UINT)rect_ptr->right;
+		box.bottom = (UINT)rect_ptr->bottom;
+		box.back = 1;
+	}
+	return box;
+}
+
 struct winrt_capture {
 	HWND window;
 	BOOL client_area;
 	BOOL force_sdr;
 	HMONITOR monitor;
 	DXGI_FORMAT format;
+
+	BOOL use_subregion;
+	RECT sub_rect;
 
 	bool capture_cursor;
 	BOOL cursor_visible;
@@ -139,13 +156,41 @@ struct winrt_capture {
 		obs_enter_graphics();
 
 		if (desc.Format == get_pixel_format(window, monitor, force_sdr)) {
-			if (!client_area || get_client_box(window, desc.Width, desc.Height, &client_box)) {
-				if (client_area) {
-					texture_width = client_box.right - client_box.left;
-					texture_height = client_box.bottom - client_box.top;
+			// 원본 코드의 지역 변수 선언 유지 (get_client_box가 D3D11_BOX*를 받는다고 가정)
+			bool current_frame_use_subregion = use_subregion;
+			RECT current_frame_actual_sub_rect = {0, 0, 0, 0}; // 실제 적용될 sub_rect (클램핑 후)
+
+			if (!client_area ||
+			    get_client_box(window, desc.Width, desc.Height, &client_box)) {
+				if (current_frame_use_subregion) {
+					current_frame_actual_sub_rect =sub_rect;
+
+					// 현재 프레임(desc) 크기에 맞게 sub_rect 클램핑
+					if (current_frame_actual_sub_rect.left < 0)
+						current_frame_actual_sub_rect.left = 0;
+					if (current_frame_actual_sub_rect.top < 0)
+						current_frame_actual_sub_rect.top = 0;
+					if (current_frame_actual_sub_rect.right > (LONG)desc.Width)
+						current_frame_actual_sub_rect.right = (LONG)desc.Width;
+					if (current_frame_actual_sub_rect.bottom > (LONG)desc.Height)
+						current_frame_actual_sub_rect.bottom = (LONG)desc.Height;
+
+					texture_width = current_frame_actual_sub_rect.right - current_frame_actual_sub_rect.left;
+					texture_height = current_frame_actual_sub_rect.bottom - current_frame_actual_sub_rect.top;
+
+					if (!(texture_width > 0 && texture_height > 0)) {
+						blog(LOG_WARNING, "Subregion for window %p resulted in zero size after clamping. Original: (%ld,%ld)-(%ld,%ld), Frame: %ux%u. Fallback to original logic.",
+						     window, sub_rect.left, sub_rect.top, sub_rect.right, sub_rect.bottom, desc.Width, desc.Height);
+						current_frame_use_subregion = false; // 이 프레임에 대해서는 subregion 사용 안함 (원본 로직으로 대체)
+					}
 				} else {
-					texture_width = desc.Width;
-					texture_height = desc.Height;
+					if (client_area) {
+						texture_width = client_box.right - client_box.left;
+						texture_height = client_box.bottom - client_box.top;
+					} else {
+						texture_width = desc.Width;
+						texture_height = desc.Height;
+					}
 				}
 
 				if (texture) {
@@ -159,22 +204,60 @@ struct winrt_capture {
 				if (!texture) {
 					const gs_color_format color_format =
 						desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? GS_RGBA16F : GS_BGRA;
-					texture = gs_texture_create(texture_width, texture_height, color_format, 1,
-								    NULL, 0);
+					texture = gs_texture_create(texture_width, texture_height, color_format, 1, NULL, 0);
 				}
 
-				if (client_area) {
-					context->CopySubresourceRegion((ID3D11Texture2D *)gs_texture_get_obj(texture),
-								       0, 0, 0, 0, frame_surface.get(), 0, &client_box);
-				} else {
-					/* if they gave an SRV, we could avoid this copy */
-					context->CopyResource((ID3D11Texture2D *)gs_texture_get_obj(texture),
-							      frame_surface.get());
+				if (texture) { // texture가 유효한 경우에만 복사
+					ID3D11Resource *obs_dx_texture_rsc = (ID3D11Resource *)gs_texture_get_obj(texture);
+					if (obs_dx_texture_rsc) {
+						if (current_frame_use_subregion) { // subregion 사용 시 CopySubresourceRegion
+							D3D11_BOX d3d_source_sub_rect_box =
+								RECT_to_D3D11_BOX(
+									&current_frame_actual_sub_rect);
+							context->CopySubresourceRegion(
+								obs_dx_texture_rsc,
+								0, 0, 0, 0,
+								frame_surface
+									.get(),
+								0,
+								&d3d_source_sub_rect_box);
+							texture_written = true;
+						} else { // subregion 미사용 시 원본 복사 로직
+							if (client_area) { // client_box 지역 변수 사용 (D3D11_BOX 타입으로 가정)
+								context->CopySubresourceRegion(
+									obs_dx_texture_rsc,
+									0, 0, 0,
+									0,
+									frame_surface
+										.get(),
+									0,
+									&client_box); // get_client_box가 채운 D3D11_BOX 사용
+								texture_written = true;
+							} else { // 전체 프레임
+								context->CopyResource(
+									obs_dx_texture_rsc,
+									frame_surface
+										.get());
+								texture_written = true;
+							}
+						}
+					} else {
+						blog(LOG_ERROR, "on_frame_arrived: Failed to get D3D resource from OBS texture for window %p.", window);
+						texture_written = false;
+					}
+				} else { // this->texture가 NULL (생성 실패 또는 크기가 0)
+					texture_written = false;
 				}
-
-				texture_written = true;
+			} else { // 원본 if (!this->client_area || get_client_box(...)) 조건이 false인 경우 (client_area=true인데 get_client_box 실패)
+				blog(LOG_WARNING, "on_frame_arrived: Client area for window %p true, but get_client_box failed. No texture written.", window);
+				if (texture) { // 기존 텍스처가 있다면 파괴
+					gs_texture_destroy(texture);
+					texture = nullptr;
+				}
+				texture_written = false;
 			}
 
+			// 프레임 풀 재생성 로직 (원본 코드와 동일, 멤버 변수 접근 시 this-> 사용)
 			if (frame_content_size.Width != last_size.Width ||
 			    frame_content_size.Height != last_size.Height) {
 				format = desc.Format;
@@ -185,8 +268,15 @@ struct winrt_capture {
 
 				last_size = frame_content_size;
 			}
-		} else {
-			active = FALSE;
+		} else { // 프레임 포맷 불일치
+			blog(LOG_WARNING, "on_frame_arrived: WGC frame format mismatch for window %p. Expected: %d, Got: %d.",
+			     window, format, desc.Format);
+			if (texture) {
+				gs_texture_destroy(texture);
+				texture = nullptr;
+			}
+			texture_written = false;
+			active = FALSE; // 멤버 active
 		}
 
 		obs_leave_graphics();
@@ -335,7 +425,7 @@ static void winrt_capture_device_loss_rebuild(void *device_void, void *data)
 }
 
 static struct winrt_capture *winrt_capture_init_internal(BOOL cursor, HWND window, BOOL client_area, BOOL force_sdr,
-							 HMONITOR monitor)
+	 												     HMONITOR monitor, BOOL use_subregion, const RECT *subregion_rect)
 try {
 	ID3D11Device *const d3d_device = (ID3D11Device *)gs_get_device_obj();
 	ComPtr<IDXGIDevice> dxgi_device;
@@ -396,9 +486,38 @@ try {
 	capture->frame_pool = frame_pool;
 	capture->session = session;
 	capture->last_size = size;
+	capture->use_subregion = use_subregion;
+	if (use_subregion && subregion_rect) {
+		capture->sub_rect = *subregion_rect; // 전달받은 RECT 값 복사
+
+		// 하위 영역 유효성 검사 및 조정 (매우 중요)
+		// crop_rect가 size 내에 있는지, 너비/높이가 양수인지 확인
+		if (capture->sub_rect.left < 0)
+			capture->sub_rect.left = 0;
+		if (capture->sub_rect.top < 0)
+			capture->sub_rect.top = 0;
+		// right, bottom은 좌표값이므로 size의 너비/높이 값과 비교
+		if (capture->sub_rect.right > size.Width)
+			capture->sub_rect.right = size.Width;
+		if (capture->sub_rect.bottom > size.Height)
+			capture->sub_rect.bottom = size.Height;
+
+		// 조정 후 너비/높이가 유효한지 최종 확인
+		if ((capture->sub_rect.right - capture->sub_rect.left) <= 0 ||
+		    (capture->sub_rect.bottom - capture->sub_rect.top) <= 0) {
+			blog(LOG_WARNING,
+			     "Subregion rectangle is invalid after clamping/validation. Disabling subregion capture for window %p.",
+			     window);
+			capture->use_subregion = FALSE; // 유효하지 않으면 하위 영역 사용 안 함
+		}
+	} else {
+		// use_subregion이 FALSE이거나 subregion_rect이 NULL인 경우 명시적으로 FALSE 설정
+		capture->use_subregion = FALSE;
+		// capture->crop_rect는 초기화되지 않아도 use_subregion이 FALSE이므로 사용되지 않음
+		// 또는 기본값으로 설정: capture->crop_rect = {0, 0, full_item_size.Width, full_item_size.Height};
+	}
 	capture->closed = item.Closed(winrt::auto_revoke, {capture, &winrt_capture::on_closed});
-	capture->frame_arrived =
-		frame_pool.FrameArrived(winrt::auto_revoke, {capture, &winrt_capture::on_frame_arrived});
+	capture->frame_arrived = frame_pool.FrameArrived(winrt::auto_revoke, {capture, &winrt_capture::on_frame_arrived});
 	capture->next = capture_list;
 	capture_list = capture;
 
@@ -421,15 +540,16 @@ try {
 	return nullptr;
 }
 
-extern "C" EXPORT struct winrt_capture *winrt_capture_init_window(BOOL cursor, HWND window, BOOL client_area,
-								  BOOL force_sdr)
+extern "C" EXPORT struct winrt_capture *winrt_capture_init_window(BOOL cursor, HWND window, BOOL client_area, BOOL force_sdr,
+	 															  BOOL use_subregion, const RECT *subregion_rect)
 {
-	return winrt_capture_init_internal(cursor, window, client_area, force_sdr, NULL);
+	return winrt_capture_init_internal(cursor, window, client_area, force_sdr, NULL, use_subregion, subregion_rect);
 }
 
-extern "C" EXPORT struct winrt_capture *winrt_capture_init_monitor(BOOL cursor, HMONITOR monitor, BOOL force_sdr)
+extern "C" EXPORT struct winrt_capture *winrt_capture_init_monitor(BOOL cursor, HMONITOR monitor, BOOL force_sdr,
+				   												   BOOL use_subregion, const RECT *subregion_rect)
 {
-	return winrt_capture_init_internal(cursor, NULL, false, force_sdr, monitor);
+	return winrt_capture_init_internal(cursor, NULL, false, force_sdr, monitor, use_subregion, subregion_rect);
 }
 
 extern "C" EXPORT void winrt_capture_free(struct winrt_capture *capture)

@@ -33,7 +33,7 @@ class VCamFilter : public DShow::OutputFilter {
 
 	video_queue_t *vq = nullptr;
 	int queue_mode = 0;
-	bool in_obs = false;
+	bool in_soop = false;
 	enum queue_state prev_state = SHARED_QUEUE_STATE_INVALID;
 	placeholder_t placeholder;
 	uint32_t obs_cx = 0;

@@ -39,6 +39,7 @@ target_sources(
     obs-ffmpeg-output.h
     obs-ffmpeg-source.c
     obs-ffmpeg-video-encoders.c
+    obs-ffmpeg-list-source.c
     obs-ffmpeg.c
 )
 
