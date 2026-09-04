@@ -3,7 +3,7 @@
 	url = https://github.com/SOOPLIVE/obs-browser.git
 [submodule "deps/libdshowcapture/src"]
 	path = deps/libdshowcapture/src
-	url = https://github.com/obsproject/libdshowcapture.git
+url=https://github.com/SOOPLIVE/libdshowcapture.git
 [submodule "plugins/obs-websocket"]
 	path = plugins/obs-websocket
 	url = https://github.com/obsproject/obs-websocket.git
