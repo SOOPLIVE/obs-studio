@@ -2107,6 +2107,20 @@ static void game_capture_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, SETTING_EXCEPTION_PROC, false);
 	obs_data_set_default_int(settings, SETTING_HOOK_RATE, (int)HOOK_RATE_NORMAL);
 	obs_data_set_default_string(settings, SETTING_RGBA10A2_SPACE, RGBA10A2_SPACE_SRGB);
+
+#pragma region _SOOP_GAME_CAPTURE_AUDIO
+	bool capture_audio = true;
+	for (uint32_t i = 1; i < 3; i++) {
+		obs_source_t* source = obs_get_output_source(i);
+		if (source) {
+			capture_audio = false;
+			obs_source_release(source);
+		}
+	}
+
+	obs_data_set_default_bool(settings, SETTING_CAPTURE_AUDIO, capture_audio);
+#pragma endregion
+
 }
 
 static bool mode_callback(obs_properties_t *ppts, obs_property_t *p, obs_data_t *settings)

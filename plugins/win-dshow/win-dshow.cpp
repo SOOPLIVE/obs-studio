@@ -17,8 +17,10 @@
 #include <algorithm>
 #include <limits>
 /* DSHOW Instance - BEGIN */
+#include <atomic>
 #include <map>
 #include <memory>
+#include <unordered_map>
 /* DSHOW Instance - END */
 #include <set>
 #include <string>
@@ -61,6 +63,9 @@ using namespace DShow;
 #define BUFFERING_VAL     "buffering"
 #define FLIP_IMAGE        "flip_vertically"
 #define AUDIO_OUTPUT_MODE "audio_output_mode"
+#pragma region _SOOP_AUDIO_OUTPUT_WARNING
+#define SOOP_AUDIO_OUTPUT_WARNING "soop_audio_output_warning"
+#pragma endregion
 #define USE_CUSTOM_AUDIO  "use_custom_audio_device"
 #define AUDIO_DEVICE_ID   "audio_device_id"
 #define COLOR_SPACE       "color_space"
@@ -94,6 +99,9 @@ using namespace DShow;
 #define TEXT_MODE_CAPTURE   obs_module_text("AudioOutputMode.Capture")
 #define TEXT_MODE_DSOUND    obs_module_text("AudioOutputMode.DirectSound")
 #define TEXT_MODE_WAVEOUT   obs_module_text("AudioOutputMode.WaveOut")
+#pragma region _SOOP_AUDIO_OUTPUT_WARNING
+#define TEXT_SOOP_AUDIO_OUTPUT_WARNING obs_module_text("SOOPAudioOutputWarning")
+#pragma endregion
 #define TEXT_CUSTOM_AUDIO   obs_module_text("UseCustomAudioDevice")
 #define TEXT_AUDIO_DEVICE   obs_module_text("AudioDevice")
 #define TEXT_ACTIVATE       obs_module_text("Activate")
@@ -192,6 +200,48 @@ public:
 	inline ~CriticalScope() { LeaveCriticalSection(mutex); }
 };
 
+/* DSHOW Instance - BEGIN */
+/* Video/audio dispatch uses shared locking.
+ * Subscriber changes use exclusive locking.
+ * SRWLOCK is not recursive. */
+class SharedSection {
+	SRWLOCK lock;
+
+	SharedSection(const SharedSection&) = delete;
+	SharedSection& operator=(const SharedSection&) = delete;
+
+public:
+	inline SharedSection() { InitializeSRWLock(&lock); }
+
+	inline operator SRWLOCK* () { return &lock; }
+};
+
+class SharedScope {
+	SRWLOCK* lock;
+
+	SharedScope() = delete;
+	SharedScope& operator=(SharedScope& ss) = delete;
+
+public:
+	inline SharedScope(SharedSection& lock_) : lock(lock_) { AcquireSRWLockShared(lock); }
+
+	inline ~SharedScope() { ReleaseSRWLockShared(lock); }
+};
+
+class ExclusiveScope {
+	SRWLOCK* lock;
+
+	ExclusiveScope() = delete;
+	ExclusiveScope& operator=(ExclusiveScope& es) = delete;
+
+public:
+	inline ExclusiveScope(SharedSection& lock_) : lock(lock_) { AcquireSRWLockExclusive(lock); }
+
+	inline ~ExclusiveScope() { ReleaseSRWLockExclusive(lock); }
+};
+/* DSHOW Instance - END */
+
+
 enum class Action {
 	None,
 	Activate,
@@ -226,6 +276,7 @@ struct DShowInstanceSettings {
 	VideoFormat videoFormat = VideoFormat::Any;
 
 	int buffering = (int)BufferingType::Auto;
+	bool hwDecode = false;
 
 	std::string colorSpace = "default";
 	std::string colorRange = "default";
@@ -243,20 +294,24 @@ struct DShowInput {
 	/* Shared graph selected by VIDEO_DEVICE_ID. */
 	std::shared_ptr<DShowInstance> instance;
 	bool deactivateWhenNotShowing = false;
-	bool showing = false;
+	/* Read by the capture callbacks, written by the UI/graph threads. */
+	std::atomic<bool> showing{ false };
 	/* DSHOW Instance - END */
 	bool flip = false;
-	bool active = false;
+	/* DSHOW Instance - BEGIN */
+	std::atomic<bool> active{ false };
+	/* DSHOW Instance - END */
 	bool autorotation = true;
-	bool hw_decode = false;
-	int sharedAudioOutputMode = (int)AudioMode::Capture;
+	//bool hw_decode = false;
+	/* DSHOW Instance - BEGIN */
+	/* Written by SyncSourceConfig() (video lock), read by the audio path, so
+	 * it must not require the video lock. */
+	std::atomic<int> sharedAudioOutputMode{ (int)AudioMode::Capture };
+	/* DSHOW Instance - END */
 	uint64_t appliedSharedSettingsVersion = 0;
-	bool destroying = false;
-	bool use_limitInterval = 0;
-	int  limitInterval = 0;
-	obs_source_frame2 limitFrame;
-
-	uint64_t lastLimitTS = 0;
+	/* DSHOW Instance - BEGIN */
+	std::atomic<bool> destroying{ false };
+	/* DSHOW Instance - END */
 
 	Decoder audio_decoder;
 	Decoder video_decoder;
@@ -269,8 +324,14 @@ struct DShowInput {
 	long lastRotation = 0;
 
 	/* DSHOW Instance - BEGIN */
-	/* Protects per-source buffers while shared callbacks are running. */
-	CriticalSection callbackMutex;
+	/* Protects per-source buffers while shared callbacks are running.
+	 * Video and audio arrive on separate DirectShow streaming threads and
+	 * touch disjoint members (frame/video_decoder/videoConfig/lastLimitTS vs
+	 * audio/audio_decoder), so they get separate locks.  Sharing one lock
+	 * would keep audio delivery queued behind video decode even after
+	 * DShowInstance stopped serializing them. */
+	CriticalSection videoCallbackMutex;
+	CriticalSection audioCallbackMutex;
 	/* DSHOW Instance - END */
 
 
@@ -306,9 +367,13 @@ struct DShowInput {
 		Deactivate();
 
 		/* Wait until any in-flight OnVideoData()/OnAudioData() call has
-		 * left before Decoder/frame/audio members are destroyed. */
+		 * left before Decoder/frame/audio members are destroyed.  Both
+		 * paths must be drained; they no longer share a lock. */
 		{
-			CriticalScope callbackScope(callbackMutex);
+			CriticalScope videoScope(videoCallbackMutex);
+		}
+		{
+			CriticalScope audioScope(audioCallbackMutex);
 		}
 		/* DSHOW Instance - END */
 	}
@@ -318,6 +383,9 @@ struct DShowInput {
 
 	void OnVideoData(const VideoConfig& config, unsigned char* data, size_t size, long long startTime,
 		long long endTime, long rotation);
+	/* DSHOW Instance - BEGIN */
+	void OnDecodedVideoData(const VideoConfig& config, const obs_source_frame2& decodedFrame, long rotation);
+	/* DSHOW Instance - END */
 	void OnAudioData(const AudioConfig& config, unsigned char* data, size_t size, long long startTime,
 		long long endTime);
 
@@ -434,11 +502,21 @@ static inline enum speaker_layout convert_speaker_layout(uint8_t channels)
 	}
 }
 
-//#define LOG_ENCODED_VIDEO_TS 1
-//#define LOG_ENCODED_AUDIO_TS 1
-
+#define LOG_ENCODED_VIDEO_TS 1
+#define LOG_ENCODED_AUDIO_TS 1
 void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char* data, size_t size, long long ts)
 {
+	/* DSHOW Instance - BEGIN */
+	/* Per-source video decode is disabled.
+	 * Encoded video is decoded once by DShowInstance and dispatched through
+	 * OnDecodedVideoData(). */
+
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(size);
+	UNUSED_PARAMETER(ts);
+
+#if 0
 	/* If format or hw decode changes, recreate the decoder */
 	if (ffmpeg_decode_valid(video_decoder) &&
 		((video_decoder->codec->id != id) || (video_decoder->hw != hw_decode))) {
@@ -466,35 +544,17 @@ void DShowInput::OnEncodedVideoData(enum AVCodecID id, unsigned char* data, size
 #if LOG_ENCODED_VIDEO_TS
 		blog(LOG_DEBUG, "video ts: %llu", frame.timestamp);
 #endif
-
-		if (!use_limitInterval) {
-			obs_source_output_video2(source, &frame);
-			lastLimitTS = frame.timestamp;
-			return;
-		}
-
-		if (limitInterval <= videoConfig.frameInterval) {
-			obs_source_output_video2(source, &frame);
-			lastLimitTS = frame.timestamp;
-			return;
-		}
-
-		const int adjustLimitInterval = limitInterval * 100;
-		if (lastLimitTS == 0 ||
-			frame.timestamp - lastLimitTS >= adjustLimitInterval)
-		{
-			lastLimitTS = frame.timestamp;
-			obs_source_output_video2(source, &frame);
-		}
+		obs_source_output_video2(source, &frame);
 	}
-
+#endif
+	/* DSHOW Instance - END */
 }
 
 
 void DShowInput::OnVideoData(const VideoConfig& config, unsigned char* data, size_t size, long long startTime,
 	long long endTime, long rotation)
 {
-	CriticalScope callbackScope(callbackMutex);
+	CriticalScope callbackScope(videoCallbackMutex);
 
 	if (destroying || !active)
 		return;
@@ -593,28 +653,33 @@ void DShowInput::OnVideoData(const VideoConfig& config, unsigned char* data, siz
 		return;
 	}
 
-	if (!use_limitInterval) {
-		obs_source_output_video2(source, &frame);
-		lastLimitTS = frame.timestamp;
-		return;
-	}
-
-	if (limitInterval <= videoConfig.frameInterval) {
-		obs_source_output_video2(source, &frame);
-		lastLimitTS = frame.timestamp;
-		return;
-	}
-
-	const int adjustLimitInterval = limitInterval * 100;
-	if (lastLimitTS == 0 ||
-		frame.timestamp - lastLimitTS >= adjustLimitInterval)
-	{
-		lastLimitTS = frame.timestamp;
-		obs_source_output_video2(source, &frame);
-	}
+	obs_source_output_video2(source, &frame);
 
 	UNUSED_PARAMETER(endTime); /* it's the enndd tiimmes! */
 }
+
+/* DSHOW Instance - BEGIN */
+void DShowInput::OnDecodedVideoData(const VideoConfig& config, const obs_source_frame2& decodedFrame, long rotation)
+{
+	CriticalScope callbackScope(videoCallbackMutex);
+
+	if (destroying || !active)
+		return;
+
+	videoConfig = config;
+
+	if (autorotation && rotation != lastRotation) {
+		lastRotation = rotation;
+		obs_source_set_async_rotation(source, rotation);
+	}
+
+	obs_source_frame2 outputFrame = decodedFrame;
+	if (flip)
+		outputFrame.flip = !outputFrame.flip;
+
+	obs_source_output_video2(source, &outputFrame);
+}
+/* DSHOW Instance - END */
 
 void DShowInput::OnEncodedAudioData(enum AVCodecID id, unsigned char* data, size_t size, long long ts)
 {
@@ -660,7 +725,7 @@ void DShowInput::OnEncodedAudioData(enum AVCodecID id, unsigned char* data, size
 void DShowInput::OnAudioData(const AudioConfig& config, unsigned char* data, size_t size, long long startTime,
 	long long endTime)
 {
-	CriticalScope callbackScope(callbackMutex);
+	CriticalScope callbackScope(audioCallbackMutex);
 
 	if (destroying || !active)
 		return;
@@ -907,6 +972,7 @@ static inline DShowInstanceSettings CopySharedDeviceSettings(obs_data_t* setting
 
 	s.videoFormat = (VideoFormat)obs_data_get_int(settings, VIDEO_FORMAT);
 	s.buffering = (int)obs_data_get_int(settings, BUFFERING_VAL);
+	s.hwDecode = obs_data_get_bool(settings, HW_DECODE);
 	s.colorSpace = obs_data_get_string(settings, COLOR_SPACE);
 	s.colorRange = obs_data_get_string(settings, COLOR_RANGE);
 
@@ -926,6 +992,7 @@ static inline void SyncPropertySettings(obs_data_t* settings, const DShowInstanc
 	obs_data_set_int(settings, VIDEO_FORMAT, (int)s.videoFormat);
 
 	obs_data_set_int(settings, BUFFERING_VAL, s.buffering);
+	obs_data_set_bool(settings, HW_DECODE, s.hwDecode);
 
 	obs_data_set_string(settings, COLOR_SPACE, s.colorSpace.c_str());
 	obs_data_set_string(settings, COLOR_RANGE, s.colorRange.c_str());
@@ -933,6 +1000,69 @@ static inline void SyncPropertySettings(obs_data_t* settings, const DShowInstanc
 	obs_data_set_int(settings, AUDIO_OUTPUT_MODE, s.audioOutputMode);
 	obs_data_set_bool(settings, USE_CUSTOM_AUDIO, s.useCustomAudio);
 	obs_data_set_string(settings, AUDIO_DEVICE_ID, s.audioDeviceId.c_str());
+}
+
+static inline bool GetEncodedVideoCodec(VideoFormat format, enum AVCodecID& codec)
+{
+	switch (format) {
+	case VideoFormat::H264:
+		codec = AV_CODEC_ID_H264;
+		return true;
+#ifdef ENABLE_HEVC
+	case VideoFormat::HEVC:
+		codec = AV_CODEC_ID_HEVC;
+		return true;
+#endif
+	case VideoFormat::MJPEG:
+		codec = AV_CODEC_ID_MJPEG;
+		return true;
+	default:
+		return false;
+	}
+}
+
+static inline enum video_colorspace GetSharedColorSpace(const DShowInstanceSettings& settings,
+	const VideoConfig& config)
+{
+	if (astrcmpi(settings.colorSpace.c_str(), "709") == 0)
+		return VIDEO_CS_709;
+	if (astrcmpi(settings.colorSpace.c_str(), "601") == 0)
+		return VIDEO_CS_601;
+	if (astrcmpi(settings.colorSpace.c_str(), "2100PQ") == 0)
+		return VIDEO_CS_2100_PQ;
+	if (astrcmpi(settings.colorSpace.c_str(), "2100HLG") == 0)
+		return VIDEO_CS_2100_HLG;
+	if (config.format == VideoFormat::P010)
+		return VIDEO_CS_2100_PQ;
+
+	return VIDEO_CS_DEFAULT;
+}
+
+static inline enum video_range_type GetSharedColorRange(const DShowInstanceSettings& settings)
+{
+	if (astrcmpi(settings.colorRange.c_str(), "full") == 0)
+		return VIDEO_RANGE_FULL;
+	if (astrcmpi(settings.colorRange.c_str(), "partial") == 0)
+		return VIDEO_RANGE_PARTIAL;
+
+	return VIDEO_RANGE_DEFAULT;
+}
+
+static inline enum video_trc GetSharedVideoTRC(enum video_colorspace cs)
+{
+	switch (cs) {
+	case VIDEO_CS_DEFAULT:
+	case VIDEO_CS_601:
+	case VIDEO_CS_709:
+	case VIDEO_CS_SRGB:
+		return VIDEO_TRC_SRGB;
+	case VIDEO_CS_2100_PQ:
+		return VIDEO_TRC_PQ;
+	case VIDEO_CS_2100_HLG:
+		return VIDEO_TRC_HLG;
+	default:
+		return VIDEO_TRC_DEFAULT;
+	}
 }
 
 static inline bool DShowGraphConfigEquals(const DShowInstanceSettings& a, const DShowInstanceSettings& b)
@@ -960,6 +1090,10 @@ class DShowInstance {
 	VideoConfig videoConfig;
 	AudioConfig audioConfig;
 
+	/* Decode encoded video once per shared DirectShow instance. */
+	Decoder sharedVideoDecoder;
+	obs_source_frame2 sharedVideoFrame;
+
 	bool deviceHasAudio = false;
 	bool deviceHasSeparateAudioFilter = false;
 
@@ -969,7 +1103,7 @@ class DShowInstance {
 	WinHandle activated_event;
 	WinHandle thread;
 
-	CriticalSection mutex;
+	SharedSection mutex;
 	vector<DShowInstanceAction> actions;
 	vector<DShowInput*> subscribers;
 	bool sharedDeviceActive = true;
@@ -982,6 +1116,7 @@ class DShowInstance {
 public:
 	explicit DShowInstance(const std::string& videoId) : device(InitGraph::False)
 	{
+		memset(&sharedVideoFrame, 0, sizeof(sharedVideoFrame));
 		snapshot.videoDeviceId = videoId;
 
 		semaphore = CreateSemaphore(nullptr, 0, 0x7FFFFFFF, nullptr);
@@ -1000,7 +1135,7 @@ public:
 	~DShowInstance()
 	{
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 
 			actions.resize(1);
 			actions[0] = DShowInstanceAction();
@@ -1017,31 +1152,31 @@ public:
 
 	DShowInstanceSettings GetSettingsSnapshot()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 		return snapshot;
 	}
 
 	VideoConfig GetVideoConfigSnapshot()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 		return videoConfig;
 	}
 
 	bool IsGraphRunning()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 		return graphRunning;
 	}
 
 	bool IsSharedDeviceActive()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 		return sharedDeviceActive;
 	}
 
 	void AddSubscriber(DShowInput* input)
 	{
-		CriticalScope scope(mutex);
+		ExclusiveScope scope(mutex);
 
 		if (std::find(subscribers.begin(), subscribers.end(), input) == subscribers.end())
 			subscribers.push_back(input);
@@ -1067,7 +1202,7 @@ public:
 
 	void RemoveSubscriber(DShowInput* input)
 	{
-		CriticalScope scope(mutex);
+		ExclusiveScope scope(mutex);
 
 		subscribers.erase(std::remove(subscribers.begin(), subscribers.end(), input), subscribers.end());
 	}
@@ -1077,7 +1212,7 @@ public:
 	void SetSharedDeviceActive(bool active, obs_data_t* settings)
 	{
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			sharedDeviceActive = active;
 
 			for (DShowInput* input : subscribers) {
@@ -1109,7 +1244,7 @@ public:
 			else {
 				obs_data_t* snapshotSettings = obs_data_create();
 				{
-					CriticalScope scope(mutex);
+					SharedScope scope(mutex);
 					SyncPropertySettings(snapshotSettings, snapshot);
 				}
 
@@ -1127,7 +1262,7 @@ public:
 		if (!ShouldKeepDeviceRunning()) {
 			OutputNullToHiddenSubscribers();
 			{
-				CriticalScope scope(mutex);
+				ExclusiveScope scope(mutex);
 				SyncAudioActiveStateLocked();
 			}
 			return;
@@ -1147,7 +1282,7 @@ public:
 
 		OutputNullToHiddenSubscribers();
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			SyncAudioActiveStateLocked();
 		}
 	}
@@ -1159,7 +1294,7 @@ public:
 		OutputNullToHiddenSubscribers();
 
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			SyncAudioActiveStateLocked();
 		}
 
@@ -1169,7 +1304,7 @@ public:
 
 	size_t SubscriberCount()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 		return subscribers.size();
 	}
 
@@ -1224,7 +1359,7 @@ public:
 
 			DShowInstanceAction item;
 			{
-				CriticalScope scope(mutex);
+				ExclusiveScope scope(mutex);
 				if (actions.size()) {
 					item = actions.front();
 					actions.erase(actions.begin());
@@ -1286,7 +1421,7 @@ public:
 	{
 		obs_data_t* settings = obs_data_create();
 		{
-			CriticalScope scope(mutex);
+			SharedScope scope(mutex);
 			SyncPropertySettings(settings, snapshot);
 		}
 
@@ -1297,8 +1432,42 @@ public:
 	void OnVideoData(const VideoConfig& config, unsigned char* data, size_t size, long long startTime,
 		long long endTime, long rotation)
 	{
-		/* Dispatch under lock to avoid subscriber lifetime races. */
-		CriticalScope scope(mutex);
+		/* Keep subscriber lifetime stable while allowing the audio callback
+		 * to run concurrently on the DirectShow audio streaming thread. */
+		SharedScope scope(mutex);
+
+		bool hasOutput = false;
+		for (DShowInput* input : subscribers) {
+			if (IsSourceOutputAllowedLocked(input)) {
+				hasOutput = true;
+				break;
+			}
+		}
+
+		if (!hasOutput)
+			return;
+
+		enum AVCodecID codec = AV_CODEC_ID_NONE;
+		if (GetEncodedVideoCodec(config.format, codec)) {
+			bool gotOutput = false;
+			if (!DecodeSharedVideoFrame(codec, config, data, size, startTime, gotOutput) || !gotOutput)
+				return;
+
+			for (DShowInput* input : subscribers) {
+				if (!IsSourceOutputAllowedLocked(input))
+					continue;
+
+				if (input->appliedSharedSettingsVersion != sharedSettingsVersion) {
+					input->SyncSourceConfig(snapshot, videoConfig);
+					input->appliedSharedSettingsVersion = sharedSettingsVersion;
+				}
+
+				input->OnDecodedVideoData(config, sharedVideoFrame, rotation);
+			}
+
+			UNUSED_PARAMETER(endTime);
+			return;
+		}
 
 		for (DShowInput* input : subscribers) {
 			if (!IsSourceOutputAllowedLocked(input))
@@ -1316,7 +1485,7 @@ public:
 	void OnAudioData(const AudioConfig& config, unsigned char* data, size_t size, long long startTime,
 		long long endTime)
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 
 		if (snapshot.audioOutputMode != (int)AudioMode::Capture)
 			return;
@@ -1333,6 +1502,46 @@ public:
 	}
 
 private:
+	bool DecodeSharedVideoFrame(enum AVCodecID codec, const VideoConfig& config, unsigned char* data,
+		size_t size, long long startTime, bool& gotOutput)
+	{
+		if (ffmpeg_decode_valid(sharedVideoDecoder) &&
+			((sharedVideoDecoder->codec->id != codec) || (sharedVideoDecoder->hw != snapshot.hwDecode))) {
+			ffmpeg_decode_free(sharedVideoDecoder);
+		}
+
+		if (!ffmpeg_decode_valid(sharedVideoDecoder)) {
+			if (ffmpeg_decode_init(sharedVideoDecoder, codec, snapshot.hwDecode) < 0) {
+				blog(LOG_WARNING, "DShowInstance: Could not initialize shared video decoder");
+				return false;
+			}
+		}
+
+		long long ts = startTime;
+		const enum video_colorspace cs = GetSharedColorSpace(snapshot, config);
+		const enum video_range_type range = GetSharedColorRange(snapshot);
+
+		gotOutput = false;
+		bool success = ffmpeg_decode_video(sharedVideoDecoder, data, size, &ts, cs, range,
+			&sharedVideoFrame, &gotOutput);
+		if (!success) {
+			blog(LOG_WARNING, "DShowInstance: Error decoding shared video frame");
+			return false;
+		}
+
+		if (!gotOutput)
+			return true;
+
+		sharedVideoFrame.timestamp = (uint64_t)ts * 100;
+		sharedVideoFrame.range = range;
+		sharedVideoFrame.trc = GetSharedVideoTRC(cs);
+
+		video_format_get_parameters_for_format(cs, range, sharedVideoFrame.format,
+			sharedVideoFrame.color_matrix, sharedVideoFrame.color_range_min, sharedVideoFrame.color_range_max);
+
+		return true;
+	}
+
 	bool QueueAction(Action action, obs_data_t* settings, bool block)
 	{
 		DShowInstanceAction item;
@@ -1345,7 +1554,7 @@ private:
 		}
 
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			actions.push_back(item);
 		}
 
@@ -1359,6 +1568,15 @@ private:
 		return true;
 	}
 
+	/* Caller must hold `mutex` exclusively.
+	*
+	* WARNING: obs_source_set_audio_active() emits source_audio_activate /
+	* audio_deactivate.  Every current handler defers to the Qt event loop
+	* via QMetaObject::invokeMethod(), so nothing re-enters DShowInstance.
+	* `mutex` is an SRWLOCK and is NOT recursive, so a handler that ever runs
+	* synchronously (same thread) and reaches SetActive() / NotifyShow() /
+	* NotifyHide() / the source update callback would deadlock here.  Keep
+	* those handlers deferred, or hoist these calls out of the lock. */
 	void SyncAudioActiveStateLocked()
 	{
 		for (DShowInput* input : subscribers) {
@@ -1375,7 +1593,7 @@ private:
 
 	void SetGraphStoppedState(bool syncAudioState = true)
 	{
-		CriticalScope scope(mutex);
+		ExclusiveScope scope(mutex);
 
 		graphRunning = false;
 		obsAudioAvailable = false;
@@ -1400,7 +1618,7 @@ private:
 
 	void OutputNullToHiddenSubscribers()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 
 		for (DShowInput* input : subscribers) {
 			if (!input || !input->source)
@@ -1421,7 +1639,7 @@ private:
 
 	bool ShouldKeepDeviceRunning()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 
 		if (!sharedDeviceActive)
 			return false;
@@ -1436,7 +1654,7 @@ private:
 
 	void OutputNullToSubscribers()
 	{
-		CriticalScope scope(mutex);
+		SharedScope scope(mutex);
 
 		for (DShowInput* input : subscribers) {
 			if (!input || !input->source)
@@ -1450,7 +1668,7 @@ private:
 	/* After Apply/OK succeeds, copy shared graph settings to all subscribers. */
 	void ApplySharedSettingsToSubscribers(obs_data_t* settings)
 	{
-		CriticalScope scope(mutex);
+		ExclusiveScope scope(mutex);
 
 		SyncAudioActiveStateLocked();
 
@@ -1483,7 +1701,7 @@ private:
 
 		bool canUpdateWithoutRestart = false;
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			canUpdateWithoutRestart = graphRunning && DShowGraphConfigEquals(snapshot, requestedSnapshot);
 
 			if (canUpdateWithoutRestart) {
@@ -1533,7 +1751,7 @@ private:
 		}
 
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			snapshot = requestedSnapshot;
 			graphRunning = true;
 			sharedSettingsVersion++;
@@ -1632,7 +1850,7 @@ private:
 	bool UpdateAudioConfig(obs_data_t* settings)
 	{
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			obsAudioAvailable = false;
 		}
 
@@ -1662,7 +1880,7 @@ private:
 
 		bool ok = device.SetAudioConfig(&audioConfig);
 		{
-			CriticalScope scope(mutex);
+			ExclusiveScope scope(mutex);
 			obsAudioAvailable = ok;
 		}
 
@@ -1856,16 +2074,15 @@ inline enum video_range_type DShowInput::GetColorRange(obs_data_t* settings) con
 /* DSHOW Instance - BEGIN */
 void DShowInput::SyncSourceConfig(obs_data_t* settings, const VideoConfig& config)
 {
-	CriticalScope callbackScope(callbackMutex);
+	/* Only video state is guarded here; sharedAudioOutputMode is atomic. */
+	CriticalScope callbackScope(videoCallbackMutex);
 
 	videoConfig = config;
 	deactivateWhenNotShowing = obs_data_get_bool(settings, DEACTIVATE_WNS);
 	flip = obs_data_get_bool(settings, FLIP_IMAGE);
 	autorotation = obs_data_get_bool(settings, AUTOROTATION);
-	hw_decode = obs_data_get_bool(settings, HW_DECODE);
+	//hw_decode = obs_data_get_bool(settings, HW_DECODE);
 	sharedAudioOutputMode = (int)obs_data_get_int(settings, AUDIO_OUTPUT_MODE);
-	limitInterval = (int)obs_data_get_int(settings, LIMIT_FRAME);
-	use_limitInterval = obs_data_get_bool(settings, USE_LIMIT_FRAME);
 
 	cs = GetColorSpace(settings);
 	const enum video_range_type range = GetColorRange(settings);
@@ -1898,10 +2115,12 @@ void DShowInput::SyncSourceConfig(obs_data_t* settings, const VideoConfig& confi
 void DShowInput::SyncSourceConfig(const DShowInstanceSettings& settings,
 	const VideoConfig& config)
 {
-	CriticalScope callbackScope(callbackMutex);
+	/* Only video state is guarded here; sharedAudioOutputMode is atomic. */
+	CriticalScope callbackScope(videoCallbackMutex);
 
 	videoConfig = config;
 	sharedAudioOutputMode = settings.audioOutputMode;
+	//hw_decode = settings.hwDecode;
 
 	if (astrcmpi(settings.colorSpace.c_str(), "709") == 0)
 		cs = VIDEO_CS_709;
@@ -2026,6 +2245,9 @@ static void* CreateDShowInput(obs_data_t* settings, obs_source_t* source)
 
 	try {
 		dshow = new DShowInput(source, settings);
+#pragma region _SOOP_SOURCE_MONITORING_TYPE
+		soop_source_set_monitoring_type(source);
+#pragma endregion
 		proc_handler_t* ph = obs_source_get_proc_handler(source);
 		proc_handler_add(ph, "void activate(bool active)", proc_activate, dshow);
 		proc_handler_add(ph, "void video_config()", proc_video_config, dshow);
@@ -2826,6 +3048,33 @@ static bool VideoFormatChanged(obs_properties_t* props, obs_property_t* p, obs_d
 	return true;
 }
 
+#pragma region _SOOP_AUDIO_OUTPUT_WARNING
+static bool AudioOutputModeClicked(obs_properties_t* props, obs_property_t* p, obs_data_t* settings)
+{
+	int audioOutputMode = (int)obs_data_get_int(settings, AUDIO_OUTPUT_MODE);
+	if (audioOutputMode) {
+		if (props) {
+			obs_property_t* p_warn = obs_properties_get(props, SOOP_AUDIO_OUTPUT_WARNING);
+			if (p_warn) {
+				obs_property_set_long_description(p_warn, TEXT_SOOP_AUDIO_OUTPUT_WARNING);
+				obs_property_text_set_info_type(p_warn, OBS_TEXT_INFO_WARNING);
+				obs_property_set_visible(p_warn, true);
+			}
+		}
+	}
+	else {
+		if (props) {
+			obs_property_t* p_warn = obs_properties_get(props, SOOP_AUDIO_OUTPUT_WARNING);
+			if (p_warn)
+				obs_property_set_visible(p_warn, false);
+		}
+	}
+
+	return true;
+}
+#pragma endregion
+
+
 static bool CustomAudioClicked(obs_properties_t* props, obs_property_t* p, obs_data_t* settings)
 {
 	bool useCustomAudio = obs_data_get_bool(settings, USE_CUSTOM_AUDIO);
@@ -2982,6 +3231,13 @@ static obs_properties_t* GetDShowProperties(void* obj)
 	obs_property_list_add_int(p, TEXT_MODE_CAPTURE, (int64_t)AudioMode::Capture);
 	obs_property_list_add_int(p, TEXT_MODE_DSOUND, (int64_t)AudioMode::DirectSound);
 	obs_property_list_add_int(p, TEXT_MODE_WAVEOUT, (int64_t)AudioMode::WaveOut);
+
+#pragma region _SOOP_AUDIO_OUTPUT_WARNING
+	obs_property_set_modified_callback(p, AudioOutputModeClicked);
+
+	p = obs_properties_add_text(ppts, SOOP_AUDIO_OUTPUT_WARNING, NULL, OBS_TEXT_INFO);
+	obs_property_set_enabled(p, false);
+#pragma endregion
 
 	if (!data->audioDevices.size())
 		return ppts;

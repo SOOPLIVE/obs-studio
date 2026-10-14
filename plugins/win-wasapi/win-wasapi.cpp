@@ -1333,7 +1333,11 @@ static void GetWASAPIDefaultsDeviceOutput(obs_data_t *settings)
 }
 
 static void GetWASAPIDefaultsProcessOutput(obs_data_t *) {}
-
+#pragma region _SOOP_WASAPI_DEFAULTS_PROCESS_OUTPUT
+static void GetSOOPWASAPIDefaultsProcessOutput(obs_data_t* settings)
+{
+	obs_data_set_default_int(settings, OPT_PRIORITY, (int)WINDOW_PRIORITY_EXE); // 게임 캡처에서 사용하는 기본 값 적용
+}
 static void wasapi_get_hooked(void *data, calldata_t *cd)
 {
 	WASAPISource *wasapi_source = reinterpret_cast<WASAPISource *>(data);
@@ -1580,6 +1584,9 @@ void RegisterWASAPIProcessOutput()
 	info.activate = ActivateWASAPISource;
 	info.deactivate = DeactivateWASAPISource;
 	info.get_defaults = GetWASAPIDefaultsProcessOutput;
+#pragma region _SOOP_WASAPI_DEFAULTS_PROCESS_OUTPUT
+	info.get_defaults = GetSOOPWASAPIDefaultsProcessOutput;
+#pragma endregion
 	info.get_properties = GetWASAPIPropertiesProcessOutput;
 	info.icon_type = OBS_ICON_TYPE_PROCESS_AUDIO_OUTPUT;
 	obs_register_source(&info);
